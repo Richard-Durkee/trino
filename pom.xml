@@ -5,7 +5,7 @@
     <parent>
         <groupId>io.airlift</groupId>
         <artifactId>airbase</artifactId>
-        <version>340</version>
+        <version>342</version>
     </parent>
 
     <groupId>io.trino</groupId>
@@ -184,14 +184,14 @@
         <air.test.jvm.additional-arguments>${air.test.jvm.additional-arguments.default}</air.test.jvm.additional-arguments>
 
         <!-- keep dependency properties sorted -->
-        <dep.airlift.version>392</dep.airlift.version>
+        <dep.airlift.version>394</dep.airlift.version>
         <dep.alluxio.version>2.9.6</dep.alluxio.version>
         <dep.antlr.version>4.13.2</dep.antlr.version>
         <dep.avro.version>1.12.1</dep.avro.version>
         <dep.aws-sdk.version>1.12.797</dep.aws-sdk.version>
         <dep.cassandra.version>4.17.0</dep.cassandra.version>
         <dep.confluent.version>7.8.0</dep.confluent.version>
-        <dep.docker.images.version>119</dep.docker.images.version>
+        <dep.docker.images.version>123</dep.docker.images.version>
         <dep.drift.version>1.24</dep.drift.version>
         <dep.frontend-maven-plugin.version>2.0.0</dep.frontend-maven-plugin.version>
         <dep.frontend-node.version>v24.12.0</dep.frontend-node.version>
@@ -203,7 +203,7 @@
         <dep.jts.version>1.20.0</dep.jts.version>
         <dep.okhttp.version>5.3.2</dep.okhttp.version>
         <dep.okio.version>3.16.4</dep.okio.version>
-        <dep.parquet.version>1.16.0</dep.parquet.version>
+        <dep.parquet.version>1.17.0</dep.parquet.version>
         <dep.protobuf.version>3.25.8</dep.protobuf.version>
         <dep.swagger.version>2.2.41</dep.swagger.version>
         <dep.takari.version>2.3.2</dep.takari.version>
@@ -297,7 +297,7 @@
             <dependency>
                 <groupId>software.amazon.awssdk</groupId>
                 <artifactId>bom</artifactId>
-                <version>2.41.0</version>
+                <version>2.41.2</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -524,7 +524,7 @@
             <dependency>
                 <groupId>com.nimbusds</groupId>
                 <artifactId>oauth2-oidc-sdk</artifactId>
-                <version>11.30.2</version>
+                <version>11.31</version>
             </dependency>
 
             <dependency>
