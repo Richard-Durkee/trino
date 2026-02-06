@@ -16,6 +16,7 @@ package io.trino.execution;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
@@ -84,6 +85,7 @@ public class QueryStats
     private final DataSize peakTaskTotalMemory;
 
     private final DataSize spilledDataSize;
+    private final Map<String, DataSize> spilledDataSizeByNode;
 
     private final boolean scheduled;
     private final OptionalDouble progressPercentage;
@@ -177,6 +179,7 @@ public class QueryStats
             @JsonProperty("peakTaskTotalMemory") DataSize peakTaskTotalMemory,
 
             @JsonProperty("spilledDataSize") DataSize spilledDataSize,
+            @JsonProperty("spilledDataSizeByNode") Map<String, DataSize> spilledDataSizeByNode,
 
             @JsonProperty("scheduled") boolean scheduled,
             @JsonProperty("progressPercentage") OptionalDouble progressPercentage,
@@ -275,6 +278,7 @@ public class QueryStats
         this.peakTaskRevocableMemory = requireNonNull(peakTaskRevocableMemory, "peakTaskRevocableMemory is null");
         this.peakTaskTotalMemory = requireNonNull(peakTaskTotalMemory, "peakTaskTotalMemory is null");
         this.spilledDataSize = requireNonNull(spilledDataSize, "spilledDataSize is null");
+        this.spilledDataSizeByNode = ImmutableMap.copyOf(requireNonNull(spilledDataSizeByNode, "spilledDataSizeByNode is null"));
         this.scheduled = scheduled;
         this.progressPercentage = requireNonNull(progressPercentage, "progressPercentage is null");
         this.runningPercentage = requireNonNull(runningPercentage, "runningPercentage is null");
@@ -795,5 +799,11 @@ public class QueryStats
     public DataSize getSpilledDataSize()
     {
         return spilledDataSize;
+    }
+
+    @JsonProperty
+    public Map<String, DataSize> getSpilledDataSizeByNode()
+    {
+        return spilledDataSizeByNode;
     }
 }

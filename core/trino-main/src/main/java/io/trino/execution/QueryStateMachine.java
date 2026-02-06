@@ -92,6 +92,7 @@ import java.util.function.Supplier;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Strings.nullToEmpty;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.units.DataSize.succinctBytes;
 import static io.trino.SystemSessionProperties.getRetryPolicy;
@@ -733,6 +734,7 @@ public class QueryStateMachine
         long totalMemoryReservation = 0;
 
         long spilledDataSize = 0;
+        Map<String, Long> spilledDataSizeByNode = new HashMap<>();
 
         long totalScheduledTime = 0;
         long failedScheduledTime = 0;
@@ -796,6 +798,8 @@ public class QueryStateMachine
             revocableMemoryReservation += stageStats.getRevocableMemoryReservation().toBytes();
             totalMemoryReservation += stageStats.getTotalMemoryReservation().toBytes();
             spilledDataSize += stageStats.getSpilledDataSize().toBytes();
+            stageStats.getSpilledDataSizeByNode().forEach((nodeId, dataSize) ->
+                    spilledDataSizeByNode.merge(nodeId, dataSize.toBytes(), Long::sum));
             totalScheduledTime += stageStats.getTotalScheduledTime().roundTo(MILLISECONDS);
             failedScheduledTime += stageStats.getFailedScheduledTime().roundTo(MILLISECONDS);
             totalCpuTime += stageStats.getTotalCpuTime().roundTo(MILLISECONDS);
@@ -950,6 +954,8 @@ public class QueryStateMachine
                 succinctBytes(getPeakTaskTotalMemory()),
 
                 succinctBytes(spilledDataSize),
+                spilledDataSizeByNode.entrySet().stream()
+                        .collect(toImmutableMap(Map.Entry::getKey, entry -> succinctBytes(entry.getValue()))),
 
                 scheduled,
                 progressPercentage,
@@ -1580,6 +1586,7 @@ public class QueryStateMachine
                 queryStats.getPeakTaskRevocableMemory(),
                 queryStats.getPeakTaskTotalMemory(),
                 queryStats.getSpilledDataSize(),
+                queryStats.getSpilledDataSizeByNode(),
                 queryStats.isScheduled(),
                 queryStats.getProgressPercentage(),
                 queryStats.getRunningPercentage(),

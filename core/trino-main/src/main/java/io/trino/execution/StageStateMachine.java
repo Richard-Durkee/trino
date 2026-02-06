@@ -41,6 +41,7 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -440,6 +441,7 @@ public class StageStateMachine
         long peakRevocableMemoryReservation = peakRevocableMemory.get();
 
         long spilledDataSize = 0;
+        Map<String, Long> spilledDataSizeByNode = new HashMap<>();
 
         long totalScheduledTime = 0;
         long failedScheduledTime = 0;
@@ -518,7 +520,10 @@ public class StageStateMachine
                 failedCumulativeUserMemory += taskStats.getCumulativeUserMemory();
             }
 
-            spilledDataSize += taskStats.getSpilledDataSize().toBytes();
+            long taskSpilledBytes = taskStats.getSpilledDataSize().toBytes();
+            spilledDataSize += taskSpilledBytes;
+            String nodeId = taskInfo.taskStatus().getNodeId();
+            spilledDataSizeByNode.merge(nodeId, taskSpilledBytes, Long::sum);
 
             totalScheduledTime += taskStats.getTotalScheduledTime().roundTo(NANOSECONDS);
             totalCpuTime += taskStats.getTotalCpuTime().roundTo(NANOSECONDS);
@@ -621,6 +626,8 @@ public class StageStateMachine
                 succinctBytes(peakUserMemoryReservation),
                 succinctBytes(peakRevocableMemoryReservation),
                 succinctBytes(spilledDataSize),
+                spilledDataSizeByNode.entrySet().stream()
+                        .collect(toImmutableMap(Map.Entry::getKey, entry -> succinctBytes(entry.getValue()))),
                 succinctDuration(totalScheduledTime, NANOSECONDS),
                 succinctDuration(failedScheduledTime, NANOSECONDS),
                 succinctDuration(totalCpuTime, NANOSECONDS),
