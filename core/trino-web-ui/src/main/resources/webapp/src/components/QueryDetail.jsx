@@ -1038,6 +1038,91 @@ export class QueryDetail extends React.Component {
         }
     }
 
+    renderSpillByNodeModal() {
+        const { query } = this.state
+
+        if (
+            !query ||
+            !query.queryStats ||
+            !query.queryStats.spilledDataSizeByNode ||
+            Object.keys(query.queryStats.spilledDataSizeByNode).length === 0
+        ) {
+            return null
+        }
+
+        const spillByNode = Object.entries(query.queryStats.spilledDataSizeByNode).sort(
+            (a, b) => parseDataSize(b[1]) - parseDataSize(a[1])
+        )
+
+        const totalSpilled = parseDataSize(query.queryStats.spilledDataSize)
+
+        return (
+            <div className="modal fade" id="spill-by-node-modal" tabIndex="-1" role="dialog">
+                <div className="modal-dialog modal-lg">
+                    <div className="modal-content" style={{ backgroundColor: '#252830' }}>
+                        <div className="modal-header" style={{ padding: '15px' }}>
+                            <button
+                                type="button"
+                                className="close"
+                                data-dismiss="modal"
+                                aria-label="Close"
+                                style={{ marginRight: '5px', marginTop: '-5px' }}
+                            >
+                                <span aria-hidden="true">&times;</span>
+                            </button>
+                            <h4 className="modal-title">Spilled Data by Worker</h4>
+                        </div>
+                        <div className="modal-body">
+                            <table className="table">
+                                <thead>
+                                    <tr>
+                                        <th>Worker</th>
+                                        <th className="text-right">Spilled Data</th>
+                                        <th className="text-right">Percentage</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {spillByNode.map(([nodeId, dataSize]) => {
+                                        const bytes = parseDataSize(dataSize)
+                                        const percentage = (bytes / totalSpilled) * 100
+                                        return (
+                                            <tr key={nodeId}>
+                                                <td>
+                                                    <a href={`/ui/worker.html?${nodeId}`}>{nodeId}</a>
+                                                </td>
+                                                <td className="text-right">{parseAndFormatDataSize(dataSize)}</td>
+                                                <td className="text-right">{percentage.toFixed(1)}%</td>
+                                            </tr>
+                                        )
+                                    })}
+                                    <tr style={{ borderTop: '2px solid #ddd' }}>
+                                        <td>
+                                            <strong>Total</strong>
+                                        </td>
+                                        <td className="text-right">
+                                            <strong>{parseAndFormatDataSize(query.queryStats.spilledDataSize)}</strong>
+                                        </td>
+                                        <td className="text-right">
+                                            <strong>
+                                                {spillByNode
+                                                    .map(
+                                                        ([, dataSize]) => (parseDataSize(dataSize) / totalSpilled) * 100
+                                                    )
+                                                    .reduce((sum, pct) => sum + pct, 0)
+                                                    .toFixed(1)}
+                                                %
+                                            </strong>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        )
+    }
+
     renderStageRefreshButton() {
         if (this.state.stageRefresh) {
             return (
@@ -1642,7 +1727,21 @@ export class QueryDetail extends React.Component {
                                             <tr>
                                                 <td className="info-title">Spilled Data</td>
                                                 <td className="info-text">
-                                                    {parseAndFormatDataSize(query.queryStats.spilledDataSize)}
+                                                    {query.queryStats.spilledDataSizeByNode &&
+                                                    Object.keys(query.queryStats.spilledDataSizeByNode).length > 0 ? (
+                                                        <a
+                                                            href="#"
+                                                            onClick={(e) => {
+                                                                e.preventDefault()
+                                                                $('#spill-by-node-modal').modal()
+                                                            }}
+                                                            style={{ textDecoration: 'underline' }}
+                                                        >
+                                                            {parseAndFormatDataSize(query.queryStats.spilledDataSize)}
+                                                        </a>
+                                                    ) : (
+                                                        parseAndFormatDataSize(query.queryStats.spilledDataSize)
+                                                    )}
                                                 </td>
                                             </tr>
                                         )}
@@ -1787,6 +1886,7 @@ export class QueryDetail extends React.Component {
                     {this.renderPreparedQuery()}
                 </div>
                 {this.renderStages(taskRetriesEnabled)}
+                {this.renderSpillByNodeModal()}
             </div>
         )
     }
