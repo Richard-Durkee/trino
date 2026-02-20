@@ -63,6 +63,7 @@ import io.trino.sql.planner.iterative.rule.ImplementIntersectDistinctAsUnion;
 import io.trino.sql.planner.iterative.rule.ImplementLimitWithTies;
 import io.trino.sql.planner.iterative.rule.ImplementOffset;
 import io.trino.sql.planner.iterative.rule.ImplementTableFunctionSource;
+import io.trino.sql.planner.iterative.rule.InlineConstantSubqueryInPredicate;
 import io.trino.sql.planner.iterative.rule.InlineProjectIntoFilter;
 import io.trino.sql.planner.iterative.rule.InlineProjections;
 import io.trino.sql.planner.iterative.rule.MergeExcept;
@@ -548,6 +549,7 @@ public class PlanOptimizers
                         ImmutableSet.of(
                                 new RemoveRedundantEnforceSingleRowNode(),
                                 new RemoveUnreferencedScalarSubqueries(),
+                                new InlineConstantSubqueryInPredicate(),
                                 new TransformUncorrelatedSubqueryToJoin(),
                                 new TransformUncorrelatedInPredicateSubqueryToSemiJoin(),
                                 new TransformCorrelatedJoinToJoin(plannerContext),
