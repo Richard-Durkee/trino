@@ -106,6 +106,7 @@ public final class SystemSessionProperties
     public static final String OPTIMIZE_METADATA_QUERIES = "optimize_metadata_queries";
     public static final String QUERY_PRIORITY = "query_priority";
     public static final String SPILL_ENABLED = "spill_enabled";
+    public static final String MARK_DISTINCT_SPILL_ENABLED = "mark_distinct_spill_enabled";
     public static final String AGGREGATION_OPERATOR_UNSPILL_MEMORY_LIMIT = "aggregation_operator_unspill_memory_limit";
     public static final String ITERATIVE_OPTIMIZER_TIMEOUT = "iterative_optimizer_timeout";
     public static final String ENABLE_FORCED_EXCHANGE_BELOW_GROUP_ID = "enable_forced_exchange_below_group_id";
@@ -502,6 +503,11 @@ public final class SystemSessionProperties
                         SPILL_ENABLED,
                         "Enable spilling",
                         featuresConfig.isSpillEnabled(),
+                        false),
+                booleanProperty(
+                        MARK_DISTINCT_SPILL_ENABLED,
+                        "Enable spilling for MarkDistinct operator. Only effective when spill_enabled is true.",
+                        true,
                         false),
                 dataSizeProperty(
                         AGGREGATION_OPERATOR_UNSPILL_MEMORY_LIMIT,
@@ -1396,6 +1402,11 @@ public final class SystemSessionProperties
     public static boolean isSpillEnabled(Session session)
     {
         return session.getSystemProperty(SPILL_ENABLED, Boolean.class);
+    }
+
+    public static boolean isMarkDistinctSpillEnabled(Session session)
+    {
+        return isSpillEnabled(session) && session.getSystemProperty(MARK_DISTINCT_SPILL_ENABLED, Boolean.class);
     }
 
     public static DataSize getAggregationOperatorUnspillMemoryLimit(Session session)
