@@ -16,6 +16,7 @@ package io.trino.operator;
 import com.google.common.annotations.VisibleForTesting;
 import io.trino.Session;
 import io.trino.spi.Page;
+import io.trino.spi.PageBuilder;
 import io.trino.spi.block.BitArrayBlock;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.RunLengthEncodedBlock;
@@ -95,5 +96,23 @@ public class MarkDistinctHash
     public MarkDistinctHash copy()
     {
         return new MarkDistinctHash(this);
+    }
+
+    /**
+     * Returns every currently buffered distinct key as a single page, one row per group, in group-id
+     * order. Used by {@link SpillableMarkDistinctHash} when it needs to hash-partition the resident
+     * key set: the caller re-partitions the returned page and either keeps rows resident (by feeding
+     * them into a fresh {@link MarkDistinctHash}) or spills them as seed rows for a partition that no
+     * longer fits in memory. This does not mutate this instance or affect {@code nextDistinctId}.
+     */
+    public Page dumpAllGroups(List<Type> types)
+    {
+        PageBuilder pageBuilder = new PageBuilder(types);
+        int groupCount = groupByHash.getGroupCount();
+        for (int groupId = 0; groupId < groupCount; groupId++) {
+            pageBuilder.declarePosition();
+            groupByHash.appendValuesTo(groupId, pageBuilder);
+        }
+        return pageBuilder.build();
     }
 }

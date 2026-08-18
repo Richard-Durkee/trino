@@ -14,6 +14,7 @@
 package io.trino.operator;
 
 import com.google.common.collect.ImmutableList;
+import io.airlift.units.DataSize;
 import io.trino.RowPagesBuilder;
 import io.trino.operator.MarkDistinctOperator.MarkDistinctOperatorFactory;
 import io.trino.spi.Page;
@@ -28,11 +29,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.parallel.Execution;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 
 import static com.google.common.base.Throwables.throwIfUnchecked;
+import static io.airlift.concurrent.MoreFutures.getFutureValue;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.trino.RowPagesBuilder.rowPagesBuilder;
 import static io.trino.SessionTestUtils.TEST_SESSION;
@@ -80,7 +83,9 @@ public class TestMarkDistinctOperator
                 new PlanNodeId("test"),
                 rowPagesBuilder.getTypes(),
                 ImmutableList.of(0),
-                hashStrategyCompiler);
+                hashStrategyCompiler,
+                false,
+                new DummySpillerFactory());
 
         MaterializedResult.Builder expected = resultBuilder(driverContext.getSession(), BIGINT, BOOLEAN);
         for (long i = 0; i < 100; i++) {
@@ -111,7 +116,9 @@ public class TestMarkDistinctOperator
                 new PlanNodeId("test"),
                 rowPagesBuilder.getTypes(),
                 ImmutableList.of(0),
-                hashStrategyCompiler);
+                hashStrategyCompiler,
+                false,
+                new DummySpillerFactory());
 
         int maskChannel = firstInput.getChannelCount(); // mask channel is appended to the input
         try (Operator operator = operatorFactory.createOperator(driverContext)) {
@@ -156,6 +163,114 @@ public class TestMarkDistinctOperator
     }
 
     @Test
+    public void testMarkDistinctSpill()
+    {
+        DummySpillerFactory spillerFactory = new DummySpillerFactory();
+        DriverContext driverContext = newDriverContext();
+        RowPagesBuilder rowPagesBuilder = rowPagesBuilder(BIGINT);
+        List<Page> input = rowPagesBuilder
+                .addSequencePage(1_000, 0)
+                .addSequencePage(1_000, 500)
+                .addSequencePage(1_000, 0)
+                .build();
+
+        OperatorFactory operatorFactory = new MarkDistinctOperatorFactory(
+                0,
+                new PlanNodeId("test"),
+                rowPagesBuilder.getTypes(),
+                ImmutableList.of(0),
+                hashStrategyCompiler,
+                true,
+                spillerFactory);
+
+        // value v in [0, 500) occurs twice (pages 1 and 3): one true, one false
+        // value v in [500, 1000) occurs three times (pages 1, 2 and 3): one true, two false
+        // value v in [1000, 1500) occurs once (page 2 only): one true
+        MaterializedResult.Builder expected = resultBuilder(driverContext.getSession(), BIGINT, BOOLEAN);
+        for (long i = 0; i < 1_500; i++) {
+            expected.row(i, true);
+        }
+        for (long i = 0; i < 500; i++) {
+            expected.row(i, false);
+        }
+        for (long i = 500; i < 1_000; i++) {
+            expected.row(i, false);
+            expected.row(i, false);
+        }
+
+        OperatorAssertion.assertOperatorEqualsIgnoreOrder(operatorFactory, driverContext, input, expected.build(), true);
+        assertThat(spillerFactory.getSpillsCount()).isGreaterThan(0);
+    }
+
+    @Test
+    public void testSpillableMarkDistinctHashRecursivePartitioning()
+            throws Exception
+    {
+        DummySpillerFactory spillerFactory = new DummySpillerFactory();
+        DriverContext driverContext = newDriverContext();
+        OperatorContext operatorContext = driverContext.addOperatorContext(0, new PlanNodeId("test"), "test");
+        List<Type> distinctTypes = ImmutableList.of(BIGINT);
+
+        // A tiny resolve-size threshold forces every spilled partition to be recursively re-partitioned
+        // at least once before it can be resolved, exercising the SpillableMarkDistinctHash recursion path
+        // directly (an operator-level test can't reliably force this: real spilled data sizes are too far
+        // below any realistic production threshold to trip it deterministically).
+        try (SpillableMarkDistinctHash hash = new SpillableMarkDistinctHash(
+                driverContext.getSession(),
+                distinctTypes,
+                distinctTypes,
+                new int[] {0},
+                hashStrategyCompiler,
+                () -> true,
+                true,
+                spillerFactory,
+                operatorContext,
+                DataSize.ofBytes(256))) {
+            RowPagesBuilder rowPagesBuilder = rowPagesBuilder(BIGINT);
+            List<Page> input = rowPagesBuilder
+                    .addSequencePage(2_000, 0)
+                    .addSequencePage(2_000, 0)
+                    .build();
+
+            List<Page> output = new ArrayList<>();
+            for (Page page : input) {
+                Work<Page> work = hash.markDistinctRows(page);
+                while (!work.process()) {
+                    // no yielding expected: every page here is already fully buffered in memory
+                }
+                Page result = work.getResult();
+                if (result != null) {
+                    output.add(result);
+                }
+                getFutureValue(hash.startMemoryRevoke());
+                hash.finishMemoryRevoke();
+            }
+
+            Page drained;
+            while ((drained = hash.pollNextDrainedPage()) != null) {
+                output.add(drained);
+            }
+
+            long trueCount = 0;
+            long falseCount = 0;
+            for (Page page : output) {
+                Block marker = page.getBlock(1);
+                for (int position = 0; position < page.getPositionCount(); position++) {
+                    if (BOOLEAN.getBoolean(marker, position)) {
+                        trueCount++;
+                    }
+                    else {
+                        falseCount++;
+                    }
+                }
+            }
+            assertThat(trueCount).isEqualTo(2_000);
+            assertThat(falseCount).isEqualTo(2_000);
+            assertThat(spillerFactory.getSpillsCount()).isGreaterThan(0);
+        }
+    }
+
+    @Test
     public void testMemoryReservationYield()
             throws Exception
     {
@@ -168,7 +283,7 @@ public class TestMarkDistinctOperator
     {
         List<Page> input = createPages(type, 6_000, 600);
 
-        OperatorFactory operatorFactory = new MarkDistinctOperatorFactory(0, new PlanNodeId("test"), ImmutableList.of(type), ImmutableList.of(0), hashStrategyCompiler);
+        OperatorFactory operatorFactory = new MarkDistinctOperatorFactory(0, new PlanNodeId("test"), ImmutableList.of(type), ImmutableList.of(0), hashStrategyCompiler, false, new DummySpillerFactory());
 
         // get result with yield; pick a relatively small buffer for partitionRowCount's memory usage
         GroupByHashYieldAssertion.GroupByHashYieldResult result = finishOperatorWithYieldingGroupByHash(input, type, operatorFactory, operator -> ((MarkDistinctOperator) operator).getCapacity(), 450_000);

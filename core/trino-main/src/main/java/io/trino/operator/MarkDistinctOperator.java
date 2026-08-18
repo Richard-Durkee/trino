@@ -16,12 +16,15 @@ package io.trino.operator;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.primitives.Ints;
+import com.google.common.util.concurrent.ListenableFuture;
+import io.airlift.units.DataSize;
 import io.trino.memory.context.LocalMemoryContext;
 import io.trino.spi.Page;
-import io.trino.spi.block.Block;
 import io.trino.spi.type.Type;
+import io.trino.spiller.SpillerFactory;
 import io.trino.sql.planner.plan.PlanNodeId;
 
+import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 
@@ -33,6 +36,10 @@ import static java.util.Objects.requireNonNull;
 public class MarkDistinctOperator
         implements Operator
 {
+    // Once a single cold partition's spilled data (seed keys + raw rows) exceeds this size, resolving it
+    // is deferred one level deeper via recursive re-partitioning instead of loading it directly.
+    private static final DataSize DEFAULT_MAX_PARTITION_RESOLVE_SIZE = DataSize.of(64, DataSize.Unit.MEGABYTE);
+
     public static class MarkDistinctOperatorFactory
             implements OperatorFactory
     {
@@ -41,6 +48,8 @@ public class MarkDistinctOperator
         private final List<Integer> markDistinctChannels;
         private final List<Type> types;
         private final FlatHashStrategyCompiler hashStrategyCompiler;
+        private final boolean spillEnabled;
+        private final SpillerFactory spillerFactory;
         private boolean closed;
 
         public MarkDistinctOperatorFactory(
@@ -48,13 +57,17 @@ public class MarkDistinctOperator
                 PlanNodeId planNodeId,
                 List<? extends Type> sourceTypes,
                 Collection<Integer> markDistinctChannels,
-                FlatHashStrategyCompiler hashStrategyCompiler)
+                FlatHashStrategyCompiler hashStrategyCompiler,
+                boolean spillEnabled,
+                SpillerFactory spillerFactory)
         {
             this.operatorId = operatorId;
             this.planNodeId = requireNonNull(planNodeId, "planNodeId is null");
             this.markDistinctChannels = ImmutableList.copyOf(requireNonNull(markDistinctChannels, "markDistinctChannels is null"));
             checkArgument(!markDistinctChannels.isEmpty(), "markDistinctChannels is empty");
             this.hashStrategyCompiler = requireNonNull(hashStrategyCompiler, "hashStrategyCompiler is null");
+            this.spillEnabled = spillEnabled;
+            this.spillerFactory = requireNonNull(spillerFactory, "spillerFactory is null");
             this.types = ImmutableList.<Type>builder()
                     .addAll(sourceTypes)
                     .add(BOOLEAN)
@@ -66,7 +79,7 @@ public class MarkDistinctOperator
         {
             checkState(!closed, "Factory is already closed");
             OperatorContext operatorContext = driverContext.addOperatorContext(operatorId, planNodeId, MarkDistinctOperator.class.getSimpleName());
-            return new MarkDistinctOperator(operatorContext, types, markDistinctChannels, hashStrategyCompiler);
+            return new MarkDistinctOperator(operatorContext, types, markDistinctChannels, hashStrategyCompiler, spillEnabled, spillerFactory);
         }
 
         @Override
@@ -78,35 +91,60 @@ public class MarkDistinctOperator
         @Override
         public OperatorFactory duplicate()
         {
-            return new MarkDistinctOperatorFactory(operatorId, planNodeId, types.subList(0, types.size() - 1), markDistinctChannels, hashStrategyCompiler);
+            return new MarkDistinctOperatorFactory(operatorId, planNodeId, types.subList(0, types.size() - 1), markDistinctChannels, hashStrategyCompiler, spillEnabled, spillerFactory);
         }
     }
 
     private final OperatorContext operatorContext;
-    private final MarkDistinctHash markDistinctHash;
+    private final SpillableMarkDistinctHash markDistinctHash;
     private final LocalMemoryContext localUserMemoryContext;
+    private final LocalMemoryContext localRevocableMemoryContext;
+    private final boolean spillEnabled;
     private final int[] markDistinctChannels;
 
     private Page inputPage;
     private boolean finishing;
 
     // for yield when memory is not available
-    private Work<Block> unfinishedWork;
+    private Work<Page> unfinishedWork;
 
-    public MarkDistinctOperator(OperatorContext operatorContext, List<Type> types, List<Integer> markDistinctChannels, FlatHashStrategyCompiler hashStrategyCompiler)
+    // finish()-time drain of any partitions that were spilled while consuming input
+    private boolean drainingStarted;
+    private boolean drainingDone;
+
+    public MarkDistinctOperator(
+            OperatorContext operatorContext,
+            List<Type> types,
+            List<Integer> markDistinctChannels,
+            FlatHashStrategyCompiler hashStrategyCompiler,
+            boolean spillEnabled,
+            SpillerFactory spillerFactory)
     {
         this.operatorContext = requireNonNull(operatorContext, "operatorContext is null");
 
         requireNonNull(markDistinctChannels, "markDistinctChannels is null");
 
+        List<Type> rawTypes = types.subList(0, types.size() - 1); // drop the trailing marker type
         ImmutableList.Builder<Type> distinctTypes = ImmutableList.builder();
         for (int channel : markDistinctChannels) {
             distinctTypes.add(types.get(channel));
         }
         this.markDistinctChannels = Ints.toArray(markDistinctChannels);
+        this.spillEnabled = spillEnabled;
 
-        this.markDistinctHash = new MarkDistinctHash(operatorContext.getSession(), distinctTypes.build(), hashStrategyCompiler, this::updateMemoryReservation);
+        this.markDistinctHash = new SpillableMarkDistinctHash(
+                operatorContext.getSession(),
+                distinctTypes.build(),
+                rawTypes,
+                this.markDistinctChannels,
+                hashStrategyCompiler,
+                this::updateMemoryReservation,
+                spillEnabled,
+                spillerFactory,
+                operatorContext,
+                DEFAULT_MAX_PARTITION_RESOLVE_SIZE);
         this.localUserMemoryContext = operatorContext.localUserMemoryContext();
+        this.localRevocableMemoryContext = operatorContext.localRevocableMemoryContext();
     }
 
     @Override
@@ -124,7 +162,7 @@ public class MarkDistinctOperator
     @Override
     public boolean isFinished()
     {
-        return finishing && !hasUnfinishedInput();
+        return finishing && !hasUnfinishedInput() && drainingDone;
     }
 
     @Override
@@ -141,13 +179,17 @@ public class MarkDistinctOperator
 
         inputPage = page;
 
-        unfinishedWork = markDistinctHash.markDistinctRows(page.getColumns(markDistinctChannels));
+        unfinishedWork = markDistinctHash.markDistinctRows(page);
         updateMemoryReservation();
     }
 
     @Override
     public Page getOutput()
     {
+        if (finishing && !hasUnfinishedInput()) {
+            return drainSpilledPartitions();
+        }
+
         if (unfinishedWork == null) {
             return null;
         }
@@ -156,8 +198,9 @@ public class MarkDistinctOperator
             return null;
         }
 
-        // add the new boolean column to the page
-        Page outputPage = inputPage.appendColumn(unfinishedWork.getResult());
+        // rows that landed in a spilled partition are excluded from this page: their marker is
+        // resolved later, during the finish()-time drain
+        Page outputPage = unfinishedWork.getResult();
 
         unfinishedWork = null;
         inputPage = null;
@@ -166,9 +209,49 @@ public class MarkDistinctOperator
         return outputPage;
     }
 
+    private Page drainSpilledPartitions()
+    {
+        if (drainingDone) {
+            return null;
+        }
+        if (!drainingStarted) {
+            drainingStarted = true;
+            if (!markDistinctHash.hasSpilledPartitions()) {
+                drainingDone = true;
+                return null;
+            }
+        }
+        Page page = markDistinctHash.pollNextDrainedPage();
+        if (page == null) {
+            drainingDone = true;
+        }
+        return page;
+    }
+
     private boolean hasUnfinishedInput()
     {
         return inputPage != null || unfinishedWork != null;
+    }
+
+    @Override
+    public ListenableFuture<Void> startMemoryRevoke()
+    {
+        checkState(spillEnabled, "Spill not enabled, no revocable memory should be reserved");
+        return markDistinctHash.startMemoryRevoke();
+    }
+
+    @Override
+    public void finishMemoryRevoke()
+    {
+        markDistinctHash.finishMemoryRevoke();
+        updateMemoryReservation();
+    }
+
+    @Override
+    public void close()
+            throws IOException
+    {
+        markDistinctHash.close();
     }
 
     /**
@@ -181,9 +264,16 @@ public class MarkDistinctOperator
     // The following implementation is a hybrid model, where the push model is going to call the pull model causing reentrancy
     private boolean updateMemoryReservation()
     {
-        // Operator/driver will be blocked on memory after we call localUserMemoryContext.setBytes().
-        // If memory is not available, once we return, this operator will be blocked until memory is available.
-        localUserMemoryContext.setBytes(markDistinctHash.getEstimatedSize());
+        long estimatedSize = markDistinctHash.getEstimatedSize();
+        if (spillEnabled) {
+            // Operator/driver will be blocked on memory after we call localRevocableMemoryContext.setBytes().
+            // If memory is not available, once we return, this operator will be blocked until memory is
+            // available, or startMemoryRevoke() is invoked to spill and free some of it.
+            localRevocableMemoryContext.setBytes(estimatedSize);
+        }
+        else {
+            localUserMemoryContext.setBytes(estimatedSize);
+        }
         // If memory is not available, inform the caller that we cannot proceed for allocation.
         return operatorContext.isWaitingForMemory().isDone();
     }
