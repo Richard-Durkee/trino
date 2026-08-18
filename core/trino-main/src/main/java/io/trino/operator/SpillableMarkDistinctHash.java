@@ -84,6 +84,12 @@ public class SpillableMarkDistinctHash
     private long[] partitionBytes;
 
     private int drainCursor;
+    // Drain state: we resolve one partition at a time, and within a partition we emit one page
+    // per pollNextDrainedPage() call to avoid buffering the entire partition in memory.
+    private MarkDistinctHash drainResolveHash;
+    private Iterator<Page> drainRawBatchIterator;
+    private List<Iterator<Page>> drainRawSpillIterators;
+    private int drainRawIteratorIndex;
     private final Deque<Page> drainQueue = new ArrayDeque<>();
 
     public SpillableMarkDistinctHash(
@@ -241,6 +247,17 @@ public class SpillableMarkDistinctHash
         return hot;
     }
 
+    /**
+     * Dumps the entire resident key set, re-partitions it, spills the rows belonging to the {@code count}
+     * partitions chosen to be newly demoted (plus any rows for partitions that were already cold), and
+     * rebuilds a fresh, smaller resident hash containing only the rows for partitions that remain hot.
+     * <p>
+     * <strong>Cost:</strong> O(n) in the number of resident keys — allocates a temporary Page holding all
+     * keys, partitions it, then rebuilds the hash. The first revoke is the most expensive (full hash dump);
+     * subsequent revokes are cheaper because the resident hash shrinks with each demotion. For a 10M-key
+     * hash this may take tens of milliseconds, but it runs at most log2(32) = 5 times before all partitions
+     * are cold, and it only runs during the memory-revoke critical path where the alternative is OOM.
+     */
     private void demotePartitions(int count)
     {
         List<Integer> hotPartitionIndexes = new java.util.ArrayList<>();
@@ -298,6 +315,13 @@ public class SpillableMarkDistinctHash
 
     private void spillRaw(int partition, Page page)
     {
+        // TODO: We spill the full row (all source columns) because the drain phase must emit complete
+        // output pages. An alternative would be spilling only the distinct columns + a row position
+        // index, then reconstructing full rows from the upstream source at drain time — but the
+        // upstream source is consumed and gone by finish(). Spilling only distinct columns is feasible
+        // if MarkDistinct's downstream consumer only needs those columns (which is sometimes true for
+        // COUNT(DISTINCT)), but that would require plan-level awareness of which columns are actually
+        // needed downstream. Left as a future optimization.
         if (page.getPositionCount() == 0) {
             return;
         }
@@ -323,14 +347,89 @@ public class SpillableMarkDistinctHash
 
     public Page pollNextDrainedPage()
     {
-        while (drainQueue.isEmpty()) {
+        // Emit buffered pages first (from recursive resolution or prior iteration)
+        if (!drainQueue.isEmpty()) {
+            return drainQueue.poll();
+        }
+
+        // Continue resolving the current partition lazily (one page at a time)
+        if (drainResolveHash != null && drainRawBatchIterator != null) {
+            Page page = drainNextFromCurrentPartition();
+            if (page != null) {
+                return page;
+            }
+        }
+
+        // Find and start resolving the next cold partition
+        while (true) {
             int partition = nextColdPartitionToResolve();
             if (partition < 0) {
                 return null;
             }
-            resolvePartitionIntoQueue(partition, 0);
+
+            if (partitionBytes[partition] > maxPartitionResolveSizeBytes) {
+                // Partition too large for single-pass resolution; recursively sub-partition it.
+                // Recursive resolution buffers into drainQueue (bounded by sub-partition size).
+                recursivelyResolve(partition, 0);
+                if (!drainQueue.isEmpty()) {
+                    return drainQueue.poll();
+                }
+                continue;
+            }
+
+            // Seed the resolve hash with pre-spill keys
+            drainResolveHash = new MarkDistinctHash(session, distinctTypes, hashStrategyCompiler, () -> true);
+            if (seedSpillers[partition] != null) {
+                for (Iterator<Page> spillBatch : seedSpillers[partition].getSpills()) {
+                    while (spillBatch.hasNext()) {
+                        forceProcess(drainResolveHash.markDistinctRows(spillBatch.next()));
+                    }
+                }
+            }
+
+            // Set up lazy raw-page iteration for this partition
+            if (rawSpillers[partition] != null) {
+                drainRawSpillIterators = rawSpillers[partition].getSpills();
+                drainRawIteratorIndex = 0;
+                drainRawBatchIterator = drainRawSpillIterators.isEmpty() ? null : drainRawSpillIterators.get(0);
+            }
+            else {
+                drainRawBatchIterator = null;
+            }
+
+            Page page = drainNextFromCurrentPartition();
+            if (page != null) {
+                return page;
+            }
+            // This partition had seeds but no raw rows — advance to next
         }
-        return drainQueue.poll();
+    }
+
+    /**
+     * Resolves and returns exactly one page from the current partition's raw spill iterator,
+     * or null if the current partition is fully drained.
+     */
+    private Page drainNextFromCurrentPartition()
+    {
+        while (drainRawBatchIterator != null) {
+            if (drainRawBatchIterator.hasNext()) {
+                Page rawPage = drainRawBatchIterator.next();
+                Page distinctColumnsPage = rawPage.getColumns(markDistinctChannels);
+                Block marker = forceProcess(drainResolveHash.markDistinctRows(distinctColumnsPage));
+                return rawPage.appendColumn(marker);
+            }
+            // Advance to next spill batch
+            drainRawIteratorIndex++;
+            if (drainRawSpillIterators != null && drainRawIteratorIndex < drainRawSpillIterators.size()) {
+                drainRawBatchIterator = drainRawSpillIterators.get(drainRawIteratorIndex);
+            }
+            else {
+                drainRawBatchIterator = null;
+                drainRawSpillIterators = null;
+                drainResolveHash = null;
+            }
+        }
+        return null;
     }
 
     private int nextColdPartitionToResolve()
@@ -345,6 +444,11 @@ public class SpillableMarkDistinctHash
         return -1;
     }
 
+    /**
+     * Eagerly resolves a partition into the provided queue. Used only by recursive resolution
+     * (where the partition is bounded by maxPartitionResolveSizeBytes / RECURSIVE_PARTITION_COUNT
+     * and thus safe to buffer in memory).
+     */
     private void resolvePartitionIntoQueue(int partition, int depth)
     {
         if (depth < MAX_RECURSION_DEPTH && partitionBytes[partition] > maxPartitionResolveSizeBytes) {
@@ -445,9 +549,19 @@ public class SpillableMarkDistinctHash
         }
     }
 
+    /**
+     * Drives a {@link Work} instance to completion synchronously. This is safe here because
+     * {@link MarkDistinctHash#markDistinctRows} always completes in a single {@code process()} call
+     * when the underlying {@link GroupByHash} has sufficient memory — and in this class, we only
+     * call {@code forceProcess} on pages that are already buffered (either from the resident hash
+     * dump or from spill files), so memory for the hash insertion is already accounted for.
+     * The loop is a defensive measure honoring the Work contract in case a future GroupByHash
+     * implementation introduces yielding on rehash.
+     */
     private static <T> T forceProcess(Work<T> work)
     {
         while (!work.process()) {
+            // See javadoc above: in practice this loop body is never entered.
         }
         return work.getResult();
     }
