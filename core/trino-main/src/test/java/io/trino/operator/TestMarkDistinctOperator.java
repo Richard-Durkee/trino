@@ -15,6 +15,7 @@ package io.trino.operator;
 
 import com.google.common.collect.ImmutableList;
 import io.airlift.units.DataSize;
+import io.trino.ExceededMemoryLimitException;
 import io.trino.RowPagesBuilder;
 import io.trino.operator.MarkDistinctOperator.MarkDistinctOperatorFactory;
 import io.trino.spi.Page;
@@ -49,6 +50,7 @@ import static io.trino.testing.TestingTaskContext.createTaskContext;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
 import static org.junit.jupiter.api.parallel.ExecutionMode.CONCURRENT;
 
@@ -307,4 +309,57 @@ public class TestMarkDistinctOperator
                 .addPipelineContext(0, true, true, false)
                 .addDriverContext();
     }
+
+    @Test
+    public void testSpillPreventsOom()
+    {
+        // Demonstrate that without spill, a large distinct key set exceeds the memory limit (OOM),
+        // but with spill enabled the same workload completes correctly.
+        int distinctKeyCount = 50_000;
+        RowPagesBuilder rowPagesBuilder = rowPagesBuilder(BIGINT);
+        List<Page> input = rowPagesBuilder
+                .addSequencePage(distinctKeyCount, 0)
+                .addSequencePage(distinctKeyCount, 0) // duplicates
+                .build();
+
+        // Without spill: tiny memory limit -> ExceededMemoryLimitException
+        assertThatThrownBy(() -> {
+            DriverContext oomDriverContext = createTaskContext(executor, scheduledExecutor, TEST_SESSION, DataSize.ofBytes(1_000))
+                    .addPipelineContext(0, true, true, false)
+                    .addDriverContext();
+            OperatorFactory noSpillFactory = new MarkDistinctOperatorFactory(
+                    0,
+                    new PlanNodeId("test"),
+                    rowPagesBuilder.getTypes(),
+                    ImmutableList.of(0),
+                    hashStrategyCompiler,
+                    false,
+                    new DummySpillerFactory());
+            OperatorAssertion.toPages(noSpillFactory, oomDriverContext, input);
+        }).isInstanceOf(ExceededMemoryLimitException.class);
+
+        // With spill: same memory limit, same data -> completes successfully
+        DummySpillerFactory spillerFactory = new DummySpillerFactory();
+        DriverContext spillDriverContext = createTaskContext(executor, scheduledExecutor, TEST_SESSION, DataSize.of(1, DataSize.Unit.MEGABYTE))
+                .addPipelineContext(0, true, true, false)
+                .addDriverContext();
+        OperatorFactory spillFactory = new MarkDistinctOperatorFactory(
+                0,
+                new PlanNodeId("test"),
+                rowPagesBuilder.getTypes(),
+                ImmutableList.of(0),
+                hashStrategyCompiler,
+                true,
+                spillerFactory);
+
+        MaterializedResult.Builder expected = resultBuilder(spillDriverContext.getSession(), BIGINT, BOOLEAN);
+        for (long i = 0; i < distinctKeyCount; i++) {
+            expected.row(i, true);
+            expected.row(i, false);
+        }
+
+        OperatorAssertion.assertOperatorEqualsIgnoreOrder(spillFactory, spillDriverContext, input, expected.build(), true);
+        assertThat(spillerFactory.getSpillsCount()).isGreaterThan(0);
+    }
+
 }
