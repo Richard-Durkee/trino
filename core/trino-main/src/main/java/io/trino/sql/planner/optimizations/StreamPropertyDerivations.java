@@ -94,6 +94,7 @@ import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static io.trino.SystemSessionProperties.isMarkDistinctSpillEnabled;
 import static io.trino.SystemSessionProperties.isSpillEnabled;
 import static io.trino.spi.predicate.TupleDomain.extractFixedValues;
 import static io.trino.sql.planner.optimizations.PropertyDerivations.isRoundRobin;
@@ -601,7 +602,8 @@ public final class StreamPropertyDerivations
         @Override
         public StreamProperties visitMarkDistinct(MarkDistinctNode node, List<StreamProperties> inputProperties)
         {
-            return Iterables.getOnlyElement(inputProperties);
+            // When spilled, rows of cold partitions are emitted at the end of the input, so the source ordering does not survive
+            return Iterables.getOnlyElement(inputProperties).unordered(isMarkDistinctSpillEnabled(session));
         }
 
         @Override

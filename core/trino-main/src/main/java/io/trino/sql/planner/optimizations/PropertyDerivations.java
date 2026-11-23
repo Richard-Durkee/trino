@@ -254,7 +254,14 @@ public final class PropertyDerivations
         @Override
         public ActualProperties visitMarkDistinct(MarkDistinctNode node, List<ActualProperties> inputProperties)
         {
-            return Iterables.getOnlyElement(inputProperties);
+            ActualProperties properties = Iterables.getOnlyElement(inputProperties);
+            if (SystemSessionProperties.isMarkDistinctSpillEnabled(session)) {
+                // When spilled, rows of cold partitions are emitted at the end of the input, so neither sorting nor grouping of the source survives
+                return ActualProperties.builderFrom(properties)
+                        .local(ImmutableList.of())
+                        .build();
+            }
+            return properties;
         }
 
         @Override

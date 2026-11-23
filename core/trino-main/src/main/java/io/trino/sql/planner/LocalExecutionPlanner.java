@@ -335,6 +335,7 @@ import static io.trino.SystemSessionProperties.isAdaptivePartialAggregationEnabl
 import static io.trino.SystemSessionProperties.isColumnarFilterEvaluationEnabled;
 import static io.trino.SystemSessionProperties.isEnableDynamicRowFiltering;
 import static io.trino.SystemSessionProperties.isForceSpillingOperator;
+import static io.trino.SystemSessionProperties.isMarkDistinctSpillEnabled;
 import static io.trino.SystemSessionProperties.isSpillEnabled;
 import static io.trino.cache.CacheUtils.uncheckedCacheGet;
 import static io.trino.cache.SafeCaches.buildNonEvictableCache;
@@ -1997,7 +1998,14 @@ public class LocalExecutionPlanner
             PhysicalOperation source = node.getSource().accept(this, context);
 
             List<Integer> channels = getChannelsForSymbols(node.getDistinctSymbols(), source.getLayout());
-            MarkDistinctOperatorFactory operator = new MarkDistinctOperatorFactory(context.getNextOperatorId(), node.getId(), source.getTypes(), channels, hashStrategyCompiler);
+            MarkDistinctOperatorFactory operator = new MarkDistinctOperatorFactory(
+                    context.getNextOperatorId(),
+                    node.getId(),
+                    source.getTypes(),
+                    channels,
+                    hashStrategyCompiler,
+                    isMarkDistinctSpillEnabled(session),
+                    spillerFactory);
             return new PhysicalOperation(operator, makeLayout(node), source);
         }
 

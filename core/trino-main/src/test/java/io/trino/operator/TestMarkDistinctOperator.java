@@ -14,6 +14,8 @@
 package io.trino.operator;
 
 import com.google.common.collect.ImmutableList;
+import io.airlift.units.DataSize;
+import io.trino.ExceededMemoryLimitException;
 import io.trino.RowPagesBuilder;
 import io.trino.operator.MarkDistinctOperator.MarkDistinctOperatorFactory;
 import io.trino.spi.Page;
@@ -21,6 +23,7 @@ import io.trino.spi.block.Block;
 import io.trino.spi.block.RunLengthEncodedBlock;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeOperators;
+import io.trino.spiller.SpillerFactory;
 import io.trino.sql.planner.plan.PlanNodeId;
 import io.trino.testing.MaterializedResult;
 import org.junit.jupiter.api.AfterAll;
@@ -28,24 +31,30 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.parallel.Execution;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 
 import static com.google.common.base.Throwables.throwIfUnchecked;
+import static io.airlift.concurrent.MoreFutures.getFutureValue;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.trino.RowPagesBuilder.rowPagesBuilder;
 import static io.trino.SessionTestUtils.TEST_SESSION;
 import static io.trino.operator.GroupByHashYieldAssertion.createPages;
 import static io.trino.operator.GroupByHashYieldAssertion.finishOperatorWithYieldingGroupByHash;
+import static io.trino.operator.OperatorAssertion.assertPagesEqualIgnoreOrder;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.VarcharType.VARCHAR;
 import static io.trino.testing.MaterializedResult.resultBuilder;
 import static io.trino.testing.TestingTaskContext.createTaskContext;
+import static io.trino.testing.assertions.Assert.assertEqualsIgnoreOrder;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
 import static org.junit.jupiter.api.parallel.ExecutionMode.CONCURRENT;
 
@@ -80,7 +89,9 @@ public class TestMarkDistinctOperator
                 new PlanNodeId("test"),
                 rowPagesBuilder.getTypes(),
                 ImmutableList.of(0),
-                hashStrategyCompiler);
+                hashStrategyCompiler,
+                false,
+                new DummySpillerFactory());
 
         MaterializedResult.Builder expected = resultBuilder(BIGINT, BOOLEAN);
         for (long i = 0; i < 100; i++) {
@@ -111,7 +122,9 @@ public class TestMarkDistinctOperator
                 new PlanNodeId("test"),
                 rowPagesBuilder.getTypes(),
                 ImmutableList.of(0),
-                hashStrategyCompiler);
+                hashStrategyCompiler,
+                false,
+                new DummySpillerFactory());
 
         int maskChannel = firstInput.getChannelCount(); // mask channel is appended to the input
         try (Operator operator = operatorFactory.createOperator(driverContext)) {
@@ -156,6 +169,143 @@ public class TestMarkDistinctOperator
     }
 
     @Test
+    public void testMarkDistinctSpill()
+            throws Exception
+    {
+        try (TestingFileSpillerFactory spillerFactory = new TestingFileSpillerFactory()) {
+            DriverContext driverContext = newDriverContext();
+            RowPagesBuilder rowPagesBuilder = rowPagesBuilder(BIGINT);
+            List<Page> input = rowPagesBuilder
+                    .addSequencePage(1_000, 0)
+                    .addSequencePage(1_000, 500)
+                    .addSequencePage(1_000, 0)
+                    .build();
+
+            OperatorFactory operatorFactory = new MarkDistinctOperatorFactory(
+                    0,
+                    new PlanNodeId("test"),
+                    rowPagesBuilder.getTypes(),
+                    ImmutableList.of(0),
+                    hashStrategyCompiler,
+                    true,
+                    spillerFactory);
+
+            // value v in [0, 500) occurs twice (pages 1 and 3): one true, one false
+            // value v in [500, 1000) occurs three times (pages 1, 2 and 3): one true, two false
+            // value v in [1000, 1500) occurs once (page 2 only): one true
+            // which occurrence is marked may differ from the non-spilled run, the (value, marker) rows do not
+            MaterializedResult.Builder expected = resultBuilder(BIGINT, BOOLEAN);
+            for (long i = 0; i < 1_500; i++) {
+                expected.row(i, true);
+            }
+            for (long i = 0; i < 500; i++) {
+                expected.row(i, false);
+            }
+            for (long i = 500; i < 1_000; i++) {
+                expected.row(i, false);
+                expected.row(i, false);
+            }
+
+            OperatorAssertion.assertOperatorEqualsIgnoreOrder(operatorFactory, driverContext, input, expected.build(), true);
+            assertThat(spillerFactory.spillCalls()).isGreaterThan(0);
+            assertThat(spillerFactory.liveSpillFiles()).describedAs("spill files are removed when the operator is closed").isEqualTo(0);
+        }
+    }
+
+    @Test
+    public void testRevokeAfterFinish()
+            throws Exception
+    {
+        try (TestingFileSpillerFactory spillerFactory = new TestingFileSpillerFactory()) {
+            DriverContext driverContext = newDriverContext();
+            RowPagesBuilder rowPagesBuilder = rowPagesBuilder(BIGINT);
+            List<Page> input = rowPagesBuilder
+                    .addSequencePage(1_000, 0)
+                    .addSequencePage(1_000, 500)
+                    .build();
+            OperatorFactory operatorFactory = new MarkDistinctOperatorFactory(
+                    0, new PlanNodeId("test"), rowPagesBuilder.getTypes(), ImmutableList.of(0), hashStrategyCompiler, true, spillerFactory);
+
+            List<Page> output = new ArrayList<>();
+            try (Operator operator = operatorFactory.createOperator(driverContext)) {
+                operator.addInput(input.get(0));
+                addNonNull(output, operator.getOutput());
+                getFutureValue(operator.startMemoryRevoke());
+                operator.finishMemoryRevoke();
+                operator.addInput(input.get(1));
+                addNonNull(output, operator.getOutput());
+                operator.finish();
+                // a revoke between finish() and the end of the drain must be harmless
+                getFutureValue(operator.startMemoryRevoke());
+                operator.finishMemoryRevoke();
+                int pollsWithRevoke = 0;
+                while (!operator.isFinished()) {
+                    addNonNull(output, operator.getOutput());
+                    if (pollsWithRevoke++ < 3) {
+                        getFutureValue(operator.startMemoryRevoke());
+                        operator.finishMemoryRevoke();
+                    }
+                }
+            }
+
+            MaterializedResult.Builder expected = resultBuilder(BIGINT, BOOLEAN);
+            for (long i = 0; i < 1_500; i++) {
+                expected.row(i, true);
+            }
+            for (long i = 500; i < 1_000; i++) {
+                expected.row(i, false);
+            }
+            assertPagesEqualIgnoreOrder(driverContext, output, expected.build());
+            assertThat(spillerFactory.liveSpillFiles()).isEqualTo(0);
+        }
+    }
+
+    @Test
+    public void testSpilledOutputMatchesNonSpilledOutput()
+            throws Exception
+    {
+        // several distinct channels, nulls and a payload column
+        List<Type> types = ImmutableList.of(BIGINT, VARCHAR, BIGINT);
+        RowPagesBuilder rowPagesBuilder = rowPagesBuilder(types);
+        Random random = new Random(11);
+        for (int page = 0; page < 30; page++) {
+            rowPagesBuilder.pageBreak();
+            for (int i = 0; i < 400; i++) {
+                rowPagesBuilder.row(
+                        random.nextInt(8) == 0 ? null : (long) random.nextInt(200),
+                        random.nextInt(8) == 0 ? null : "k" + random.nextInt(7),
+                        (long) i);
+            }
+        }
+        List<Page> input = rowPagesBuilder.build();
+
+        MaterializedResult plain = materialize(new DummySpillerFactory(), false, input, types);
+        try (TestingFileSpillerFactory spillerFactory = new TestingFileSpillerFactory()) {
+            MaterializedResult spilled = materialize(spillerFactory, true, input, types);
+            assertThat(spillerFactory.spillCalls()).isGreaterThan(0);
+            // which duplicate carries the marker may differ, the multiset of rows may not
+            assertEqualsIgnoreOrder(spilled.getMaterializedRows(), plain.getMaterializedRows());
+            assertThat(spillerFactory.liveSpillFiles()).isEqualTo(0);
+        }
+    }
+
+    private MaterializedResult materialize(SpillerFactory spillerFactory, boolean spill, List<Page> input, List<Type> types)
+    {
+        DriverContext driverContext = newDriverContext();
+        OperatorFactory operatorFactory = new MarkDistinctOperatorFactory(
+                0, new PlanNodeId("test"), types, ImmutableList.of(0, 1), hashStrategyCompiler, spill, spillerFactory);
+        List<Page> pages = OperatorAssertion.toPages(operatorFactory, driverContext, input, spill);
+        return OperatorAssertion.toMaterializedResult(ImmutableList.<Type>builder().addAll(types).add(BOOLEAN).build(), pages);
+    }
+
+    private static void addNonNull(List<Page> output, Page page)
+    {
+        if (page != null) {
+            output.add(page);
+        }
+    }
+
+    @Test
     public void testMemoryReservationYield()
             throws Exception
     {
@@ -168,7 +318,7 @@ public class TestMarkDistinctOperator
     {
         List<Page> input = createPages(type, 6_000, 600);
 
-        OperatorFactory operatorFactory = new MarkDistinctOperatorFactory(0, new PlanNodeId("test"), ImmutableList.of(type), ImmutableList.of(0), hashStrategyCompiler);
+        OperatorFactory operatorFactory = new MarkDistinctOperatorFactory(0, new PlanNodeId("test"), ImmutableList.of(type), ImmutableList.of(0), hashStrategyCompiler, false, new DummySpillerFactory());
 
         // get result with yield; pick a relatively small buffer for partitionRowCount's memory usage
         GroupByHashYieldAssertion.GroupByHashYieldResult result = finishOperatorWithYieldingGroupByHash(input, type, operatorFactory, operator -> ((MarkDistinctOperator) operator).getCapacity(), 450_000);
@@ -191,5 +341,59 @@ public class TestMarkDistinctOperator
         return createTaskContext(executor, scheduledExecutor, TEST_SESSION)
                 .addPipelineContext(0, true, true, false)
                 .addDriverContext();
+    }
+
+    @Test
+    public void testSpillPreventsOom()
+            throws Exception
+    {
+        // Demonstrate that without spill, a large distinct key set exceeds the memory limit (OOM),
+        // but with spill enabled the same workload completes correctly.
+        int distinctKeyCount = 50_000;
+        RowPagesBuilder rowPagesBuilder = rowPagesBuilder(BIGINT);
+        List<Page> input = rowPagesBuilder
+                .addSequencePage(distinctKeyCount, 0)
+                .addSequencePage(distinctKeyCount, 0) // duplicates
+                .build();
+
+        // Without spill: tiny memory limit -> ExceededMemoryLimitException
+        assertThatThrownBy(() -> {
+            DriverContext oomDriverContext = createTaskContext(executor, scheduledExecutor, TEST_SESSION, DataSize.ofBytes(1_000))
+                    .addPipelineContext(0, true, true, false)
+                    .addDriverContext();
+            OperatorFactory noSpillFactory = new MarkDistinctOperatorFactory(
+                    0,
+                    new PlanNodeId("test"),
+                    rowPagesBuilder.getTypes(),
+                    ImmutableList.of(0),
+                    hashStrategyCompiler,
+                    false,
+                    new DummySpillerFactory());
+            OperatorAssertion.toPages(noSpillFactory, oomDriverContext, input);
+        }).isInstanceOf(ExceededMemoryLimitException.class);
+
+        // With spill: same data -> completes successfully
+        try (TestingFileSpillerFactory spillerFactory = new TestingFileSpillerFactory()) {
+            DriverContext spillDriverContext = createTaskContext(executor, scheduledExecutor, TEST_SESSION, DataSize.of(1, DataSize.Unit.MEGABYTE))
+                    .addPipelineContext(0, true, true, false)
+                    .addDriverContext();
+            OperatorFactory spillFactory = new MarkDistinctOperatorFactory(
+                    0,
+                    new PlanNodeId("test"),
+                    rowPagesBuilder.getTypes(),
+                    ImmutableList.of(0),
+                    hashStrategyCompiler,
+                    true,
+                    spillerFactory);
+
+            MaterializedResult.Builder expected = resultBuilder(BIGINT, BOOLEAN);
+            for (long i = 0; i < distinctKeyCount; i++) {
+                expected.row(i, true);
+                expected.row(i, false);
+            }
+
+            OperatorAssertion.assertOperatorEqualsIgnoreOrder(spillFactory, spillDriverContext, input, expected.build(), true);
+            assertThat(spillerFactory.spillCalls()).isGreaterThan(0);
+        }
     }
 }

@@ -15,6 +15,11 @@ footprint to pass at the cost of slower execution times. Spilling is supported f
 aggregations, joins (inner and outer), sorting, and window functions. This property does not
 reduce memory usage required for other join types.
 
+Spilling of the distinct tracking used by aggregations with `DISTINCT` is off by
+default. Set the session property `mark_distinct_spill_enabled` to `true` to
+include it, in addition to `spill_enabled`. When it spills, the output order of
+that step is not preserved.
+
 ## `spiller-spill-path`
 
 - **Type:** {ref}`prop-type-string`

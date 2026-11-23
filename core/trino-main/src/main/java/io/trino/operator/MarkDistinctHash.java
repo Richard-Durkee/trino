@@ -16,6 +16,7 @@ package io.trino.operator;
 import com.google.common.annotations.VisibleForTesting;
 import io.trino.Session;
 import io.trino.spi.Page;
+import io.trino.spi.PageBuilder;
 import io.trino.spi.block.BitArrayBlock;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.RunLengthEncodedBlock;
@@ -24,11 +25,13 @@ import io.trino.spi.type.Type;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 import static com.google.common.base.Preconditions.checkState;
 import static io.trino.operator.GroupByHash.createGroupByHash;
 import static io.trino.spi.block.Bitmap.set;
 import static io.trino.spi.block.Bitmap.wordsForBits;
+import static java.lang.Math.toIntExact;
 
 public class MarkDistinctHash
 {
@@ -95,5 +98,28 @@ public class MarkDistinctHash
     public MarkDistinctHash copy()
     {
         return new MarkDistinctHash(this);
+    }
+
+    /**
+     * Passes every key whose distinct marker has already been produced to {@code consumer}, one row per
+     * group in group-id order, in pages of bounded size. Keys that were inserted by a {@link Work} that
+     * has not completed yet are skipped, because their rows have not been emitted and must still be
+     * reported as distinct when that page is processed again. This does not mutate this instance.
+     */
+    public void dumpMarkedGroups(List<Type> types, Consumer<Page> consumer)
+    {
+        PageBuilder pageBuilder = new PageBuilder(types);
+        int markedGroupCount = toIntExact(nextDistinctId);
+        for (int groupId = 0; groupId < markedGroupCount; groupId++) {
+            pageBuilder.declarePosition();
+            groupByHash.appendValuesTo(groupId, pageBuilder);
+            if (pageBuilder.isFull()) {
+                consumer.accept(pageBuilder.build());
+                pageBuilder.reset();
+            }
+        }
+        if (!pageBuilder.isEmpty()) {
+            consumer.accept(pageBuilder.build());
+        }
     }
 }
