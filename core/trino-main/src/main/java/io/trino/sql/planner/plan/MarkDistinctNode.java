@@ -16,6 +16,7 @@ package io.trino.sql.planner.plan;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.errorprone.annotations.Immutable;
 import io.trino.sql.planner.Symbol;
@@ -33,13 +34,22 @@ public class MarkDistinctNode
     private final Symbol markerSymbol;
 
     private final List<Symbol> distinctSymbols;
+    // Either empty, or all the distinct symbols if the source is grouped on them: equal rows are adjacent.
+    // Set by AddLocalExchanges only, from the local properties of the source.
+    private final List<Symbol> preGroupedSymbols;
+
+    public MarkDistinctNode(PlanNodeId id, PlanNode source, Symbol markerSymbol, List<Symbol> distinctSymbols)
+    {
+        this(id, source, markerSymbol, distinctSymbols, ImmutableList.of());
+    }
 
     @JsonCreator
     public MarkDistinctNode(
             @JsonProperty("id") PlanNodeId id,
             @JsonProperty("source") PlanNode source,
             @JsonProperty("markerSymbol") Symbol markerSymbol,
-            @JsonProperty("distinctSymbols") List<Symbol> distinctSymbols)
+            @JsonProperty("distinctSymbols") List<Symbol> distinctSymbols,
+            @JsonProperty("preGroupedSymbols") List<Symbol> preGroupedSymbols)
     {
         super(id);
         this.source = requireNonNull(source, "source is null");
@@ -47,6 +57,9 @@ public class MarkDistinctNode
         requireNonNull(distinctSymbols, "distinctSymbols is null");
         checkArgument(!distinctSymbols.isEmpty(), "distinctSymbols cannot be empty");
         this.distinctSymbols = ImmutableList.copyOf(distinctSymbols);
+        requireNonNull(preGroupedSymbols, "preGroupedSymbols is null");
+        checkArgument(preGroupedSymbols.isEmpty() || ImmutableSet.copyOf(preGroupedSymbols).equals(ImmutableSet.copyOf(distinctSymbols)), "Pre-grouped symbols must be empty or all the distinct symbols");
+        this.preGroupedSymbols = ImmutableList.copyOf(preGroupedSymbols);
     }
 
     @Override
@@ -82,6 +95,12 @@ public class MarkDistinctNode
         return distinctSymbols;
     }
 
+    @JsonProperty
+    public List<Symbol> getPreGroupedSymbols()
+    {
+        return preGroupedSymbols;
+    }
+
     @Override
     public <R, C> R accept(PlanVisitor<R, C> visitor, C context)
     {
@@ -91,6 +110,6 @@ public class MarkDistinctNode
     @Override
     public PlanNode replaceChildren(List<PlanNode> newChildren)
     {
-        return new MarkDistinctNode(getId(), Iterables.getOnlyElement(newChildren), markerSymbol, distinctSymbols);
+        return new MarkDistinctNode(getId(), Iterables.getOnlyElement(newChildren), markerSymbol, distinctSymbols, preGroupedSymbols);
     }
 }

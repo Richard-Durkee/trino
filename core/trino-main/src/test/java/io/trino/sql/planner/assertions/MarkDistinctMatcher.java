@@ -19,6 +19,7 @@ import io.trino.sql.planner.plan.MarkDistinctNode;
 import io.trino.sql.planner.plan.PlanNode;
 
 import java.util.List;
+import java.util.Optional;
 
 import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Preconditions.checkState;
@@ -32,11 +33,21 @@ public class MarkDistinctMatcher
 {
     private final PlanTestSymbol markerSymbol;
     private final List<PlanTestSymbol> distinctSymbols;
+    private final Optional<List<PlanTestSymbol>> preGroupedSymbols;
 
     public MarkDistinctMatcher(PlanTestSymbol markerSymbol, List<PlanTestSymbol> distinctSymbols)
     {
+        this(markerSymbol, distinctSymbols, Optional.empty());
+    }
+
+    /**
+     * @param preGroupedSymbols if present, the pre-grouped symbols of the node have to be the same set of symbols
+     */
+    public MarkDistinctMatcher(PlanTestSymbol markerSymbol, List<PlanTestSymbol> distinctSymbols, Optional<List<PlanTestSymbol>> preGroupedSymbols)
+    {
         this.markerSymbol = requireNonNull(markerSymbol, "markerSymbol is null");
         this.distinctSymbols = ImmutableList.copyOf(distinctSymbols);
+        this.preGroupedSymbols = requireNonNull(preGroupedSymbols, "preGroupedSymbols is null").map(ImmutableList::copyOf);
     }
 
     @Override
@@ -56,6 +67,12 @@ public class MarkDistinctMatcher
             return NO_MATCH;
         }
 
+        if (preGroupedSymbols.isPresent()
+                && !ImmutableSet.copyOf(markDistinctNode.getPreGroupedSymbols())
+                .equals(preGroupedSymbols.get().stream().map(alias -> alias.toSymbol(context.symbolAliases())).collect(toImmutableSet()))) {
+            return NO_MATCH;
+        }
+
         return match(markerSymbol.toString(), markDistinctNode.getMarkerSymbol().toSymbolReference());
     }
 
@@ -65,6 +82,7 @@ public class MarkDistinctMatcher
         return toStringHelper(this)
                 .add("markerSymbol", markerSymbol)
                 .add("distinctSymbols", distinctSymbols)
+                .add("preGroupedSymbols", preGroupedSymbols)
                 .toString();
     }
 }

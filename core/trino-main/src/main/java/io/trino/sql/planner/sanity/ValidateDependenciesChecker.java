@@ -176,6 +176,7 @@ public final class ValidateDependenciesChecker
             source.accept(this, boundSymbols); // visit child
 
             checkDependencies(source.getOutputSymbols(), node.getDistinctSymbols(), "Invalid node. Mark distinct symbols (%s) not in source plan output (%s)", node.getDistinctSymbols(), source.getOutputSymbols());
+            checkDependencies(source.getOutputSymbols(), node.getPreGroupedSymbols(), "Invalid node. Pre-grouped symbols (%s) not in source plan output (%s)", node.getPreGroupedSymbols(), source.getOutputSymbols());
 
             return null;
         }

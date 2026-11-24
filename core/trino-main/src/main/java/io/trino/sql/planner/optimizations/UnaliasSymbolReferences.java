@@ -237,13 +237,15 @@ public class UnaliasSymbolReferences
 
             Symbol newMarkerSymbol = mapper.map(node.getMarkerSymbol());
             List<Symbol> newDistinctSymbols = mapper.mapAndDistinct(node.getDistinctSymbols());
+            List<Symbol> newPreGroupedSymbols = mapper.mapAndDistinct(node.getPreGroupedSymbols());
 
             return new PlanAndMappings(
                     new MarkDistinctNode(
                             node.getId(),
                             rewrittenSource.getRoot(),
                             newMarkerSymbol,
-                            newDistinctSymbols),
+                            newDistinctSymbols,
+                            newPreGroupedSymbols),
                     mapping);
         }
 

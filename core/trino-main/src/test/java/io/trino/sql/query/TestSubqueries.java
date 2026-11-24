@@ -1759,4 +1759,79 @@ public class TestSubqueries
                 "SELECT (SELECT 'a' AS x, 1)"))
                 .matches("SELECT (SELECT CAST(ROW('a', 1) AS row(x varchar(1), integer)))");
     }
+
+    // The check for more than one row of a correlated scalar subquery streams when its input is grouped on the
+    // unique id of the outer row, so the results of these tests are compared with equivalent queries that do not have it.
+    // The engine cannot prove that a single row matches in any of them, so the check is planned.
+
+    @Test
+    public void testCorrelatedScalarSubqueryWithMatches()
+    {
+        assertThat(assertions.query(
+                "SELECT l.orderkey, l.linenumber, (SELECT n.name FROM nation n WHERE n.nationkey = l.suppkey % 25) FROM lineitem l"))
+                .matches("SELECT l.orderkey, l.linenumber, n.name FROM lineitem l LEFT JOIN nation n ON n.nationkey = l.suppkey % 25");
+    }
+
+    @Test
+    public void testCorrelatedScalarSubqueryWithoutMatches()
+    {
+        assertThat(assertions.query(
+                "SELECT l.orderkey, l.linenumber, (SELECT n.name FROM nation n WHERE n.nationkey = l.suppkey % 25 + 10) FROM lineitem l"))
+                .matches("SELECT l.orderkey, l.linenumber, n.name FROM lineitem l LEFT JOIN nation n ON n.nationkey = l.suppkey % 25 + 10");
+    }
+
+    @Test
+    public void testCorrelatedScalarSubqueryWithEmptyResult()
+    {
+        assertThat(assertions.query(
+                "SELECT l.orderkey, (SELECT n.name FROM nation n WHERE n.nationkey = l.suppkey % 25 AND n.nationkey < 0) FROM lineitem l"))
+                .matches("SELECT l.orderkey, CAST(NULL AS varchar(25)) FROM lineitem l");
+    }
+
+    @Test
+    public void testCorrelatedScalarSubqueryWithNullCorrelationKey()
+    {
+        assertThat(assertions.query(
+                "SELECT o.orderkey, (SELECT c.name FROM customer c WHERE c.custkey = IF(o.orderkey % 7 = 0, NULL, o.custkey)) FROM orders o"))
+                .matches("SELECT o.orderkey, c.name FROM orders o LEFT JOIN customer c ON c.custkey = IF(o.orderkey % 7 = 0, NULL, o.custkey)");
+    }
+
+    @Test
+    public void testTwoCorrelatedScalarSubqueries()
+    {
+        assertThat(assertions.query(
+                "SELECT l.orderkey, l.linenumber, " +
+                        "(SELECT n.name FROM nation n WHERE n.nationkey = l.suppkey % 25), " +
+                        "(SELECT r.name FROM region r WHERE r.regionkey = l.suppkey % 5) " +
+                        "FROM lineitem l"))
+                .matches("SELECT l.orderkey, l.linenumber, n.name, r.name " +
+                        "FROM lineitem l " +
+                        "LEFT JOIN nation n ON n.nationkey = l.suppkey % 25 " +
+                        "LEFT JOIN region r ON r.regionkey = l.suppkey % 5");
+    }
+
+    @Test
+    public void testCorrelatedScalarSubqueryReturningAtMostOneRow()
+    {
+        assertThat(assertions.query(
+                "SELECT o.orderkey, (SELECT l.linenumber FROM lineitem l WHERE l.orderkey = o.orderkey AND l.linenumber = 1) FROM orders o"))
+                .matches("SELECT o.orderkey, l.linenumber FROM orders o LEFT JOIN lineitem l ON l.orderkey = o.orderkey AND l.linenumber = 1");
+    }
+
+    @Test
+    public void testCorrelatedScalarSubqueryReturningMultipleRows()
+    {
+        assertThat(assertions.query(
+                "SELECT o.orderkey, (SELECT l.linenumber FROM lineitem l WHERE l.orderkey = o.orderkey) FROM orders o"))
+                .failure().hasMessage("Scalar sub-query has returned multiple rows");
+    }
+
+    @Test
+    public void testCorrelatedScalarSubqueryReturningMultipleRowsForOneOuterRow()
+    {
+        // only the orders with key 7 have more than one matching row
+        assertThat(assertions.query(
+                "SELECT o.orderkey, (SELECT l.linenumber FROM lineitem l WHERE l.orderkey = o.orderkey AND (l.linenumber = 1 OR o.orderkey = 7 AND l.linenumber <= 2)) FROM orders o"))
+                .failure().hasMessage("Scalar sub-query has returned multiple rows");
+    }
 }

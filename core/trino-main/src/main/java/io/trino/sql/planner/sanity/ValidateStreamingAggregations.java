@@ -26,6 +26,7 @@ import io.trino.sql.planner.SymbolsExtractor;
 import io.trino.sql.planner.optimizations.LocalProperties;
 import io.trino.sql.planner.optimizations.StreamPropertyDerivations.StreamProperties;
 import io.trino.sql.planner.plan.AggregationNode;
+import io.trino.sql.planner.plan.MarkDistinctNode;
 import io.trino.sql.planner.plan.PlanNode;
 import io.trino.sql.planner.plan.PlanVisitor;
 import io.trino.sql.planner.sanity.PlanSanityChecker.Checker;
@@ -38,7 +39,10 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static io.trino.sql.planner.optimizations.StreamPropertyDerivations.derivePropertiesRecursively;
 
 /**
- * Verifies that input of streaming aggregations is grouped on the grouping keys
+ * Verifies that the final plan still derives grouping of the input of streaming aggregations and of streaming
+ * mark distinct on the grouping keys and the distinct symbols, respectively. This is a consistency check with
+ * the properties derived when the plan was made, for example if a later optimizer changed the input. It is not
+ * independent evidence that the input is grouped: it derives the properties with the same code as the optimizer.
  */
 public class ValidateStreamingAggregations
         implements Checker
@@ -87,6 +91,22 @@ public class ValidateStreamingAggregations
             Iterator<Optional<LocalProperty<Symbol>>> matchIterator = LocalProperties.match(properties.getLocalProperties(), desiredProperties).iterator();
             Optional<LocalProperty<Symbol>> unsatisfiedRequirement = Iterators.getOnlyElement(matchIterator);
             checkArgument(unsatisfiedRequirement.isEmpty(), "Streaming aggregation with input not grouped on the grouping keys");
+            return null;
+        }
+
+        @Override
+        public Void visitMarkDistinct(MarkDistinctNode node, Void context)
+        {
+            visitPlan(node, context);
+            if (node.getPreGroupedSymbols().isEmpty()) {
+                return null;
+            }
+
+            StreamProperties properties = derivePropertiesRecursively(node.getSource(), plannerContext, session, symbolAllocator);
+
+            List<LocalProperty<Symbol>> desiredProperties = ImmutableList.of(new GroupingProperty<>(node.getPreGroupedSymbols()));
+            Optional<LocalProperty<Symbol>> unsatisfiedRequirement = Iterators.getOnlyElement(LocalProperties.match(properties.getLocalProperties(), desiredProperties).iterator());
+            checkArgument(unsatisfiedRequirement.isEmpty(), "Streaming mark distinct with input not grouped on the distinct symbols");
             return null;
         }
     }

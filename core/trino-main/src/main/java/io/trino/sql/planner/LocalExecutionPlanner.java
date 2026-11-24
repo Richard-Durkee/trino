@@ -90,6 +90,7 @@ import io.trino.operator.SpatialIndexBuilderOperator.SpatialPredicate;
 import io.trino.operator.SpatialJoinOperator.SpatialJoinOperatorFactory;
 import io.trino.operator.StatisticsWriterOperator.StatisticsWriterOperatorFactory;
 import io.trino.operator.StreamingAggregationOperator;
+import io.trino.operator.StreamingMarkDistinctOperator;
 import io.trino.operator.TableFinishOperator.TableFinishOperatorFactory;
 import io.trino.operator.TableFinishOperator.TableFinisher;
 import io.trino.operator.TableMutationOperator.TableMutationOperatorFactory;
@@ -1997,7 +1998,13 @@ public class LocalExecutionPlanner
             PhysicalOperation source = node.getSource().accept(this, context);
 
             List<Integer> channels = getChannelsForSymbols(node.getDistinctSymbols(), source.getLayout());
-            MarkDistinctOperatorFactory operator = new MarkDistinctOperatorFactory(context.getNextOperatorId(), node.getId(), source.getTypes(), channels, hashStrategyCompiler);
+            OperatorFactory operator;
+            if (node.getPreGroupedSymbols().isEmpty()) {
+                operator = new MarkDistinctOperatorFactory(context.getNextOperatorId(), node.getId(), source.getTypes(), channels, hashStrategyCompiler);
+            }
+            else {
+                operator = StreamingMarkDistinctOperator.createOperatorFactory(context.getNextOperatorId(), node.getId(), source.getTypes(), channels, joinCompiler);
+            }
             return new PhysicalOperation(operator, makeLayout(node), source);
         }
 

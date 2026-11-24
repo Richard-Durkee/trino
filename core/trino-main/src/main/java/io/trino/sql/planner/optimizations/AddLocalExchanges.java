@@ -13,6 +13,7 @@
  */
 package io.trino.sql.planner.optimizations;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
@@ -124,6 +125,28 @@ public class AddLocalExchanges
     {
         PlanWithProperties result = plan.accept(new Rewriter(context.idAllocator(), context.symbolAllocator(), context.session()), any());
         return result.getNode();
+    }
+
+    /**
+     * Whether rows that are equal on all the symbols are adjacent in the child, as derived from its local properties.
+     * An exchange between the child and the node, which interleaves rows, shows in the local properties as well.
+     * <p>
+     * Only grouping on all the symbols is used and not on a subset of them. Local properties are not reliable for
+     * a subset: for example, GroupId repeats its input once per grouping set and still keeps the properties of the
+     * common grouping columns, which makes rows with equal values of these columns non-adjacent.
+     * <p>
+     * Constant properties are not used as evidence. AssignUniqueId declares its input columns constant after the
+     * grouping on its id, which is only true within a group of that id. When a join that can spill drops the grouping
+     * as order-sensitive, the constants stay and then read as constant for the whole stream.
+     */
+    @VisibleForTesting
+    static boolean isGroupedOnAll(List<Symbol> symbols, List<LocalProperty<Symbol>> localProperties)
+    {
+        List<LocalProperty<Symbol>> groupingProperties = localProperties.stream()
+                .filter(property -> !(property instanceof ConstantProperty))
+                .collect(toImmutableList());
+        // an empty result means that the property is satisfied completely
+        return LocalProperties.match(groupingProperties, LocalProperties.grouped(symbols)).get(0).isEmpty();
     }
 
     private class Rewriter
@@ -564,11 +587,14 @@ public class AddLocalExchanges
 
             PlanWithProperties child = planAndEnforce(node.getSource(), childRequirements, childRequirements);
 
+            List<LocalProperty<Symbol>> localProperties = child.getProperties().getLocalProperties();
+            List<Symbol> distinctSymbols = pruneMarkDistinctSymbols(node, localProperties);
             MarkDistinctNode result = new MarkDistinctNode(
                     node.getId(),
                     child.getNode(),
                     node.getMarkerSymbol(),
-                    pruneMarkDistinctSymbols(node, child.getProperties().getLocalProperties()));
+                    distinctSymbols,
+                    isGroupedOnAll(distinctSymbols, localProperties) ? distinctSymbols : ImmutableList.of());
 
             return deriveProperties(result, child.getProperties());
         }

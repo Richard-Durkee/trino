@@ -857,12 +857,14 @@ public class PlanPrinter
         @Override
         public Void visitMarkDistinct(MarkDistinctNode node, Context context)
         {
-            addNode(node,
-                    "MarkDistinct",
-                    ImmutableMap.of(
-                            "distinct", formatOutputs(node.getDistinctSymbols()),
-                            "marker", anonymizer.anonymize(node.getMarkerSymbol())),
-                    context);
+            ImmutableMap.Builder<String, String> descriptor = ImmutableMap.<String, String>builder()
+                    .put("distinct", formatOutputs(node.getDistinctSymbols()))
+                    .put("marker", anonymizer.anonymize(node.getMarkerSymbol()));
+            if (!node.getPreGroupedSymbols().isEmpty()) {
+                // equal rows are adjacent, as for a streaming aggregation
+                descriptor.put("streaming", "true");
+            }
+            addNode(node, "MarkDistinct", descriptor.buildOrThrow(), context);
 
             return processChildren(node, new Context(context.isInitialPlan()));
         }

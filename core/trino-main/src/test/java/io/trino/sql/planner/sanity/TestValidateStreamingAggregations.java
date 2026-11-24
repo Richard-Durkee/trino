@@ -32,6 +32,7 @@ import org.junit.jupiter.api.Test;
 import java.util.function.Function;
 
 import static io.trino.spi.type.BigintType.BIGINT;
+import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.sql.planner.plan.AggregationNode.Step.SINGLE;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -95,6 +96,37 @@ public class TestValidateStreamingAggregations
                                                 ImmutableMap.of(p.symbol("nationkey", BIGINT), new TpchColumnHandle("nationkey", BIGINT)))))))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Streaming aggregation with input not grouped on the grouping keys");
+    }
+
+    @Test
+    public void testValidateStreamingMarkDistinctSuccessful()
+    {
+        validatePlan(
+                p -> p.markDistinct(
+                        p.symbol("marker", BOOLEAN),
+                        ImmutableList.of(p.symbol("unique")),
+                        ImmutableList.of(p.symbol("unique")),
+                        p.assignUniqueId(p.symbol("unique"),
+                                p.tableScan(
+                                        nationTableHandle,
+                                        ImmutableList.of(p.symbol("nationkey", BIGINT)),
+                                        ImmutableMap.of(p.symbol("nationkey", BIGINT), new TpchColumnHandle("nationkey", BIGINT))))));
+    }
+
+    @Test
+    public void testValidateStreamingMarkDistinctFailed()
+    {
+        assertThatThrownBy(() -> validatePlan(
+                p -> p.markDistinct(
+                        p.symbol("marker", BOOLEAN),
+                        ImmutableList.of(p.symbol("nationkey")),
+                        ImmutableList.of(p.symbol("nationkey")),
+                        p.tableScan(
+                                nationTableHandle,
+                                ImmutableList.of(p.symbol("nationkey", BIGINT)),
+                                ImmutableMap.of(p.symbol("nationkey", BIGINT), new TpchColumnHandle("nationkey", BIGINT))))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Streaming mark distinct with input not grouped on the distinct symbols");
     }
 
     private void validatePlan(Function<PlanBuilder, PlanNode> planProvider)

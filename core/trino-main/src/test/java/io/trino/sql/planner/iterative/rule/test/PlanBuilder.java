@@ -356,6 +356,11 @@ public class PlanBuilder
         return new MarkDistinctNode(idAllocator.getNextId(), source, markerSymbol, distinctSymbols);
     }
 
+    public MarkDistinctNode markDistinct(Symbol markerSymbol, List<Symbol> distinctSymbols, List<Symbol> preGroupedSymbols, PlanNode source)
+    {
+        return new MarkDistinctNode(idAllocator.getNextId(), source, markerSymbol, distinctSymbols, preGroupedSymbols);
+    }
+
     public FilterNode filter(Expression predicate, PlanNode source)
     {
         return filter(idAllocator.getNextId(), predicate, source);

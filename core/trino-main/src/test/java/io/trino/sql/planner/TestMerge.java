@@ -125,7 +125,8 @@ public class TestMerge
                                 new Case(
                                         ImmutableList.of(new WhenClause(new Call(NOT, ImmutableList.of(new Reference(BOOLEAN, "is_distinct"))), new Cast(new Call(FAIL, ImmutableList.of(new Constant(INTEGER, (long) MERGE_TARGET_ROW_MULTIPLE_MATCHES.toErrorCode().getCode()), new Constant(VARCHAR, utf8Slice("One MERGE target table row matched more than one source row")))), BOOLEAN))),
                                         TRUE),
-                                markDistinct("is_distinct", ImmutableList.of("unique_id", "case_number"),
+                                // the merge row ids come out of a join, which gives no grouping guarantee on unique_id
+                                markDistinct("is_distinct", ImmutableList.of("unique_id", "case_number"), ImmutableList.of(),
                                         anyTree(
                                                 project(ImmutableMap.of(
                                                                 "unique_id", expression(new Coalesce(ImmutableList.of(new Reference(BIGINT, "target_unique_id"), new Reference(BIGINT, "source_unique_id")))),

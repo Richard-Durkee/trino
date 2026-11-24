@@ -372,6 +372,18 @@ public final class PlanMatchPattern
                 toSymbolAliases(distinctSymbols)));
     }
 
+    public static PlanMatchPattern markDistinct(
+            String markerSymbol,
+            List<String> distinctSymbols,
+            List<String> preGroupedSymbols,
+            PlanMatchPattern source)
+    {
+        return node(MarkDistinctNode.class, source).with(new MarkDistinctMatcher(
+                new SymbolAlias(markerSymbol),
+                toSymbolAliases(distinctSymbols),
+                Optional.of(toSymbolAliases(preGroupedSymbols))));
+    }
+
     public static PlanMatchPattern window(Consumer<WindowMatcher.Builder> handler, PlanMatchPattern source)
     {
         WindowMatcher.Builder builder = new WindowMatcher.Builder(source);
