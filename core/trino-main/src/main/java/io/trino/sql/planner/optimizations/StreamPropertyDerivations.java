@@ -443,7 +443,10 @@ public final class StreamPropertyDerivations
                 inputToOutputMappings.putIfAbsent(argument, argument);
             }
 
-            return Iterables.getOnlyElement(inputProperties).translate(column -> Optional.ofNullable(inputToOutputMappings.get(column)));
+            // with several grouping sets the rows of an input page are repeated, so the output is not ordered
+            return Iterables.getOnlyElement(inputProperties)
+                    .translate(column -> Optional.ofNullable(inputToOutputMappings.get(column)))
+                    .unordered(node.getGroupingSets().size() > 1);
         }
 
         @Override

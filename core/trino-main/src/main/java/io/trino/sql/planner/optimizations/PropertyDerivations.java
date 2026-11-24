@@ -411,7 +411,17 @@ public final class PropertyDerivations
                 inputToOutputMappings.putIfAbsent(argument, argument);
             }
 
-            return Iterables.getOnlyElement(inputProperties).translate(column -> Optional.ofNullable(inputToOutputMappings.get(column)));
+            ActualProperties translated = Iterables.getOnlyElement(inputProperties).translate(column -> Optional.ofNullable(inputToOutputMappings.get(column)));
+            if (node.getGroupingSets().size() == 1) {
+                return translated;
+            }
+            // GroupId emits all the rows of an input page once for each grouping set, so rows with equal values
+            // are not adjacent and the output is not sorted, even if the input is. Only constants remain.
+            return ActualProperties.builderFrom(translated)
+                    .local(translated.getLocalProperties().stream()
+                            .takeWhile(ConstantProperty.class::isInstance)
+                            .collect(toImmutableList()))
+                    .build();
         }
 
         @Override

@@ -38,9 +38,9 @@ import java.util.Set;
 import java.util.function.Function;
 
 import static com.google.common.base.MoreObjects.toStringHelper;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.sql.planner.SystemPartitioningHandle.COORDINATOR_DISTRIBUTION;
 import static io.trino.sql.planner.SystemPartitioningHandle.SINGLE_DISTRIBUTION;
-import static io.trino.util.MoreLists.filteredCopy;
 import static java.util.Objects.requireNonNull;
 
 public class ActualProperties
@@ -246,7 +246,11 @@ public class ActualProperties
         {
             List<LocalProperty<Symbol>> localProperties = this.localProperties;
             if (unordered) {
-                localProperties = filteredCopy(this.localProperties, property -> !property.isOrderSensitive());
+                // Properties that follow an order-sensitive property can depend on it: for example, a constant of
+                // AssignUniqueId is only constant within a group of the id. Without it, the constant would be wrong.
+                localProperties = localProperties.stream()
+                        .takeWhile(property -> !property.isOrderSensitive())
+                        .collect(toImmutableList());
             }
             return new ActualProperties(global, localProperties, constants);
         }
