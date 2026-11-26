@@ -29,7 +29,6 @@ import io.trino.memory.context.AggregatedMemoryContext;
 import io.trino.metadata.TestingFunctionResolution;
 import io.trino.operator.GroupByHashYieldAssertion.GroupByHashYieldResult;
 import io.trino.operator.HashAggregationOperator.HashAggregationOperatorFactory;
-import io.trino.operator.aggregation.AccumulatorFactory;
 import io.trino.operator.aggregation.AggregatorFactory;
 import io.trino.operator.aggregation.OrderedAccumulatorFactory;
 import io.trino.operator.aggregation.TestingAggregationFunction;
@@ -60,11 +59,13 @@ import org.junit.jupiter.api.parallel.Execution;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -334,7 +335,7 @@ public class TestHashAggregationOperator
             throws Exception
     {
         TestingAggregationFunction arrayAgg = FUNCTION_RESOLUTION.getAggregateFunction("array_agg", fromTypes(BIGINT));
-        AccumulatorFactory distinctOrderedFactory = new OrderedAccumulatorFactory(
+        OrderedAccumulatorFactory distinctOrderedFactory = new OrderedAccumulatorFactory(
                 arrayAgg.getDistinctFactory(),
                 ImmutableList.of(BIGINT),
                 ImmutableList.of(0),
@@ -344,11 +345,10 @@ public class TestHashAggregationOperator
         AggregatorFactory aggregatorFactory = new AggregatorFactory(
                 distinctOrderedFactory,
                 SINGLE,
-                arrayAgg.getIntermediateType(),
+                distinctOrderedFactory.spillType(),
                 arrayAgg.getFinalType(),
                 ImmutableList.of(0),
                 OptionalInt.empty(),
-                false, // spillable
                 ImmutableList.of());
 
         // a single group with all values distinct
@@ -400,12 +400,13 @@ public class TestHashAggregationOperator
         }
     }
 
-    // grouped ordered aggregation evaluates every group across several batches and output pages without spilling
+    // grouped ordered aggregation evaluates every group across several batches and output pages
+    // spill is enabled, but memory is never revoked, so nothing spills
     @Test
     public void testOrderedAggregationEvaluatesInBatches()
     {
         TestingAggregationFunction arrayAgg = FUNCTION_RESOLUTION.getAggregateFunction("array_agg", fromTypes(BIGINT));
-        AccumulatorFactory orderedFactory = new OrderedAccumulatorFactory(
+        OrderedAccumulatorFactory orderedFactory = new OrderedAccumulatorFactory(
                 arrayAgg.getDistinctFactory(),
                 ImmutableList.of(BIGINT),
                 ImmutableList.of(0),
@@ -416,11 +417,10 @@ public class TestHashAggregationOperator
         AggregatorFactory aggregatorFactory = new AggregatorFactory(
                 orderedFactory,
                 SINGLE,
-                arrayAgg.getIntermediateType(),
+                orderedFactory.spillType(),
                 arrayAgg.getFinalType(),
                 ImmutableList.of(0),
                 OptionalInt.empty(),
-                false, // spillable
                 ImmutableList.of());
 
         int groupCount = 40_000;
@@ -463,10 +463,298 @@ public class TestHashAggregationOperator
                 DEFAULT_GRANULARITY);
 
         DriverContext driverContext = createDriverContext();
-        List<Page> pages = toPages(operatorFactory, driverContext, input, true);
+        List<Page> pages = toPages(operatorFactory, driverContext, input, false);
         assertThat(pages).hasSizeGreaterThan(1);
         assertPagesEqualIgnoreOrder(driverContext, pages, expectedBuilder.build());
         assertThat(spillerFactory.getSpillsCount()).isZero();
+    }
+
+    @Test
+    public void testDistinctOrderedAggregationSpill()
+    {
+        testDistinctOrderedAggregationSpill(true, 8, Integer.MAX_VALUE);
+        testDistinctOrderedAggregationSpill(true, 0, 0);
+        testDistinctOrderedAggregationSpill(true, 8, 0);
+        testDistinctOrderedAggregationSpill(false, 8, 0);
+    }
+
+    // array_agg(DISTINCT x ORDER BY x DESC) GROUP BY g, where every row appears twice, in pages spilled separately
+    private void testDistinctOrderedAggregationSpill(boolean revokeMemoryWhenAddingPages, long memoryLimitForMerge, long memoryLimitForMergeWithMemory)
+    {
+        TestingAggregationFunction arrayAgg = FUNCTION_RESOLUTION.getAggregateFunction("array_agg", fromTypes(BIGINT));
+        OrderedAccumulatorFactory orderedFactory = new OrderedAccumulatorFactory(
+                arrayAgg.getDistinctFactory(),
+                ImmutableList.of(BIGINT),
+                ImmutableList.of(0),
+                ImmutableList.of(0),
+                ImmutableList.of(DESC_NULLS_LAST),
+                new PagesIndex.TestingFactory(false));
+        AggregatorFactory aggregatorFactory = new AggregatorFactory(
+                orderedFactory,
+                SINGLE,
+                orderedFactory.spillType(),
+                arrayAgg.getFinalType(),
+                ImmutableList.of(0),
+                OptionalInt.empty(),
+                ImmutableList.of());
+
+        int groupCount = 10_000;
+        int valuesPerGroup = 5;
+        List<Page> input = new ArrayList<>();
+        for (int copy = 0; copy < 2; copy++) {
+            for (int round = 0; round < valuesPerGroup; round++) {
+                input.add(new Page(
+                        createLongSequenceBlock(round * groupCount, (round + 1) * groupCount),
+                        createLongSequenceBlock(0, groupCount)));
+            }
+        }
+
+        MaterializedResult.Builder expectedBuilder = resultBuilder(BIGINT, new ArrayType(BIGINT));
+        for (long group = 0; group < groupCount; group++) {
+            List<Long> values = new ArrayList<>();
+            for (long round = valuesPerGroup - 1; round >= 0; round--) {
+                values.add(round * groupCount + group);
+            }
+            expectedBuilder.row(group, values);
+        }
+
+        DummySpillerFactory spillerFactory = new DummySpillerFactory();
+        HashAggregationOperatorFactory operatorFactory = createSpillingOperatorFactory(1, ImmutableList.of(aggregatorFactory), spillerFactory, memoryLimitForMerge, memoryLimitForMergeWithMemory);
+
+        DriverContext driverContext = createDriverContext();
+        List<Page> pages = toPages(operatorFactory, driverContext, input, revokeMemoryWhenAddingPages);
+        assertPagesEqualIgnoreOrder(driverContext, pages, expectedBuilder.build());
+        if (revokeMemoryWhenAddingPages) {
+            assertThat(spillerFactory.getSpillsCount()).isPositive();
+        }
+    }
+
+    @Test
+    public void testDistinctAggregationSpill()
+    {
+        testDistinctAggregationSpill(true, 8, Integer.MAX_VALUE);
+        testDistinctAggregationSpill(true, 0, 0);
+        testDistinctAggregationSpill(true, 8, 0);
+        testDistinctAggregationSpill(false, 8, 0);
+    }
+
+    // sum(DISTINCT x), count(x) GROUP BY g, where every row appears twice, in pages spilled separately
+    private void testDistinctAggregationSpill(boolean revokeMemoryWhenAddingPages, long memoryLimitForMerge, long memoryLimitForMergeWithMemory)
+    {
+        AggregatorFactory distinctSum = FUNCTION_RESOLUTION.getAggregateFunction("sum", fromTypes(BIGINT))
+                .createDistinctAggregatorFactory(SINGLE, ImmutableList.of(0), OptionalInt.empty());
+        AggregatorFactory count = FUNCTION_RESOLUTION.getAggregateFunction("count", fromTypes(BIGINT))
+                .createAggregatorFactory(SINGLE, ImmutableList.of(0), OptionalInt.empty());
+
+        int groupCount = 10_000;
+        int valuesPerGroup = 5;
+        List<Page> input = new ArrayList<>();
+        for (int copy = 0; copy < 2; copy++) {
+            for (int round = 0; round < valuesPerGroup; round++) {
+                input.add(new Page(
+                        createLongSequenceBlock(round * groupCount, (round + 1) * groupCount),
+                        createLongSequenceBlock(0, groupCount)));
+            }
+        }
+
+        MaterializedResult.Builder expectedBuilder = resultBuilder(BIGINT, BIGINT, BIGINT);
+        for (long group = 0; group < groupCount; group++) {
+            long sum = 0;
+            for (long round = 0; round < valuesPerGroup; round++) {
+                sum += round * groupCount + group;
+            }
+            expectedBuilder.row(group, sum, 2L * valuesPerGroup);
+        }
+
+        DummySpillerFactory spillerFactory = new DummySpillerFactory();
+        HashAggregationOperatorFactory operatorFactory = createSpillingOperatorFactory(1, ImmutableList.of(distinctSum, count), spillerFactory, memoryLimitForMerge, memoryLimitForMergeWithMemory);
+
+        DriverContext driverContext = createDriverContext();
+        List<Page> pages = toPages(operatorFactory, driverContext, input, revokeMemoryWhenAddingPages);
+        assertPagesEqualIgnoreOrder(driverContext, pages, expectedBuilder.build());
+        if (revokeMemoryWhenAddingPages) {
+            assertThat(spillerFactory.getSpillsCount()).isPositive();
+        }
+    }
+
+    @Test
+    public void testOrderedAggregationWithFilterSpill()
+    {
+        testOrderedAggregationWithFilterSpill(true, 8, Integer.MAX_VALUE);
+        testOrderedAggregationWithFilterSpill(true, 0, 0);
+        testOrderedAggregationWithFilterSpill(true, 8, 0);
+    }
+
+    // array_agg(x ORDER BY y) FILTER (WHERE f) GROUP BY g, with null values of x and groups whose rows are all filtered out
+    private void testOrderedAggregationWithFilterSpill(boolean revokeMemoryWhenAddingPages, long memoryLimitForMerge, long memoryLimitForMergeWithMemory)
+    {
+        TestingAggregationFunction arrayAgg = FUNCTION_RESOLUTION.getAggregateFunction("array_agg", fromTypes(BIGINT));
+        OrderedAccumulatorFactory orderedFactory = new OrderedAccumulatorFactory(
+                arrayAgg.getFactory(),
+                ImmutableList.of(BIGINT, BIGINT),
+                ImmutableList.of(0),
+                ImmutableList.of(1),
+                ImmutableList.of(ASC_NULLS_LAST),
+                new PagesIndex.TestingFactory(false));
+        AggregatorFactory aggregatorFactory = new AggregatorFactory(
+                orderedFactory,
+                SINGLE,
+                orderedFactory.spillType(),
+                arrayAgg.getFinalType(),
+                ImmutableList.of(0, 1),
+                OptionalInt.of(3),
+                ImmutableList.of());
+
+        // channels: x, y, g, f
+        int groupCount = 1_000;
+        int rounds = 6;
+        List<Page> input = new ArrayList<>();
+        for (int round = 0; round < rounds; round++) {
+            BlockBuilder values = BIGINT.createBlockBuilder(null, groupCount);
+            BlockBuilder filter = BOOLEAN.createBlockBuilder(null, groupCount);
+            for (int group = 0; group < groupCount; group++) {
+                if (isNullValue(group, round)) {
+                    values.appendNull();
+                }
+                else {
+                    BIGINT.writeLong(values, (long) round * groupCount + group);
+                }
+                BOOLEAN.writeBoolean(filter, isSelected(group, round));
+            }
+            input.add(new Page(
+                    values.build(),
+                    RunLengthEncodedBlock.create(BIGINT, (long) (rounds - round), groupCount),
+                    createLongSequenceBlock(0, groupCount),
+                    filter.build()));
+        }
+
+        MaterializedResult.Builder expectedBuilder = resultBuilder(BIGINT, new ArrayType(BIGINT));
+        for (int group = 0; group < groupCount; group++) {
+            List<Long> values = new ArrayList<>();
+            // y decreases with the round, so ascending y is descending round
+            for (int round = rounds - 1; round >= 0; round--) {
+                if (isSelected(group, round)) {
+                    values.add(isNullValue(group, round) ? null : (long) round * groupCount + group);
+                }
+            }
+            expectedBuilder.row((long) group, values.isEmpty() ? null : values);
+        }
+
+        DummySpillerFactory spillerFactory = new DummySpillerFactory();
+        HashAggregationOperatorFactory operatorFactory = createSpillingOperatorFactory(2, ImmutableList.of(aggregatorFactory), spillerFactory, memoryLimitForMerge, memoryLimitForMergeWithMemory);
+
+        DriverContext driverContext = createDriverContext();
+        List<Page> pages = toPages(operatorFactory, driverContext, input, revokeMemoryWhenAddingPages);
+        assertPagesEqualIgnoreOrder(driverContext, pages, expectedBuilder.build());
+        assertThat(spillerFactory.getSpillsCount()).isPositive();
+    }
+
+    @Test
+    public void testDistinctAggregationWithFilterSpill()
+    {
+        testDistinctAggregationWithFilterSpill(true, 8, Integer.MAX_VALUE);
+        testDistinctAggregationWithFilterSpill(true, 0, 0);
+        testDistinctAggregationWithFilterSpill(true, 8, 0);
+    }
+
+    // count(DISTINCT s) FILTER (WHERE f), max_by(DISTINCT s, v) GROUP BY g, with null values of s,
+    // repeated values within a group, every row twice in pages spilled separately, and groups whose rows are all filtered out
+    private void testDistinctAggregationWithFilterSpill(boolean revokeMemoryWhenAddingPages, long memoryLimitForMerge, long memoryLimitForMergeWithMemory)
+    {
+        AggregatorFactory countDistinct = FUNCTION_RESOLUTION.getAggregateFunction("count", fromTypes(VARCHAR))
+                .createDistinctAggregatorFactory(SINGLE, ImmutableList.of(0), OptionalInt.of(3));
+        AggregatorFactory maxByDistinct = FUNCTION_RESOLUTION.getAggregateFunction("max_by", fromTypes(VARCHAR, BIGINT))
+                .createDistinctAggregatorFactory(SINGLE, ImmutableList.of(0, 1), OptionalInt.empty());
+
+        // channels: s, v, g, f
+        int groupCount = 1_000;
+        int rounds = 6;
+        List<Page> input = new ArrayList<>();
+        for (int copy = 0; copy < 2; copy++) {
+            for (int round = 0; round < rounds; round++) {
+                BlockBuilder values = VARCHAR.createBlockBuilder(null, groupCount);
+                BlockBuilder filter = BOOLEAN.createBlockBuilder(null, groupCount);
+                for (int group = 0; group < groupCount; group++) {
+                    String value = distinctValue(group, round);
+                    if (value == null) {
+                        values.appendNull();
+                    }
+                    else {
+                        VARCHAR.writeString(values, value);
+                    }
+                    BOOLEAN.writeBoolean(filter, isSelected(group, round));
+                }
+                input.add(new Page(
+                        values.build(),
+                        RunLengthEncodedBlock.create(BIGINT, (long) round, groupCount),
+                        createLongSequenceBlock(0, groupCount),
+                        filter.build()));
+            }
+        }
+
+        MaterializedResult.Builder expectedBuilder = resultBuilder(BIGINT, BIGINT, VARCHAR);
+        for (int group = 0; group < groupCount; group++) {
+            Set<String> selectedValues = new HashSet<>();
+            for (int round = 0; round < rounds; round++) {
+                String value = distinctValue(group, round);
+                if (value != null && isSelected(group, round)) {
+                    selectedValues.add(value);
+                }
+            }
+            // v is the round, so max_by returns the value of the last round
+            expectedBuilder.row((long) group, (long) selectedValues.size(), distinctValue(group, rounds - 1));
+        }
+
+        DummySpillerFactory spillerFactory = new DummySpillerFactory();
+        HashAggregationOperatorFactory operatorFactory = createSpillingOperatorFactory(2, ImmutableList.of(countDistinct, maxByDistinct), spillerFactory, memoryLimitForMerge, memoryLimitForMergeWithMemory);
+
+        DriverContext driverContext = createDriverContext();
+        List<Page> pages = toPages(operatorFactory, driverContext, input, revokeMemoryWhenAddingPages);
+        assertPagesEqualIgnoreOrder(driverContext, pages, expectedBuilder.build());
+        assertThat(spillerFactory.getSpillsCount()).isPositive();
+    }
+
+    // rounds r and r + 3 repeat the same value
+    private static String distinctValue(int group, int round)
+    {
+        if (isNullValue(group, round)) {
+            return null;
+        }
+        return "value_" + (round % 3) + "_" + group;
+    }
+
+    private static boolean isNullValue(int group, int round)
+    {
+        return (group + round) % 5 == 0;
+    }
+
+    // every seventh group has no selected rows
+    private static boolean isSelected(int group, int round)
+    {
+        return group % 7 != 0 && (group + round) % 3 != 0;
+    }
+
+    private HashAggregationOperatorFactory createSpillingOperatorFactory(int groupByChannel, List<AggregatorFactory> aggregatorFactories, DummySpillerFactory spillerFactory, long memoryLimitForMerge, long memoryLimitForMergeWithMemory)
+    {
+        return new HashAggregationOperatorFactory(
+                0,
+                new PlanNodeId("test"),
+                ImmutableList.of(BIGINT),
+                Ints.asList(groupByChannel),
+                ImmutableList.of(),
+                SINGLE,
+                false,
+                aggregatorFactories,
+                OptionalInt.empty(),
+                100_000,
+                Optional.of(DataSize.of(16, MEGABYTE)),
+                true,
+                succinctBytes(memoryLimitForMerge),
+                succinctBytes(memoryLimitForMergeWithMemory),
+                spillerFactory,
+                hashStrategyCompiler,
+                Optional.empty(),
+                DEFAULT_GRANULARITY);
     }
 
     @Test

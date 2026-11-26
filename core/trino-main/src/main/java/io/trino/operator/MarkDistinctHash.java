@@ -16,6 +16,7 @@ package io.trino.operator;
 import com.google.common.annotations.VisibleForTesting;
 import io.trino.Session;
 import io.trino.spi.Page;
+import io.trino.spi.PageBuilder;
 import io.trino.spi.block.BitArrayBlock;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.RunLengthEncodedBlock;
@@ -59,6 +60,15 @@ public class MarkDistinctHash
     public Work<Block> markDistinctRows(Page page)
     {
         return new TransformWork<>(groupByHash.getGroupIds(page), groupIds -> processNextGroupIds(groupByHash.getGroupCount(), groupIds, page.getPositionCount()));
+    }
+
+    /**
+     * Appends the values of all channels of the distinct row with the given id, in the order of the hash types.
+     * Distinct ids are assigned in the order the rows are first marked distinct, starting at zero.
+     */
+    public void appendValuesTo(int distinctId, PageBuilder pageBuilder)
+    {
+        groupByHash.appendValuesTo(distinctId, pageBuilder);
     }
 
     @VisibleForTesting

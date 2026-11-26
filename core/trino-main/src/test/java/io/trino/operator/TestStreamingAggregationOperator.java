@@ -22,7 +22,6 @@ import io.trino.execution.TaskId;
 import io.trino.memory.MemoryPool;
 import io.trino.memory.QueryContext;
 import io.trino.metadata.TestingFunctionResolution;
-import io.trino.operator.aggregation.AccumulatorFactory;
 import io.trino.operator.aggregation.AggregatorFactory;
 import io.trino.operator.aggregation.OrderedAccumulatorFactory;
 import io.trino.operator.aggregation.TestingAggregationFunction;
@@ -323,7 +322,7 @@ public class TestStreamingAggregationOperator
 
     private static AggregatorFactory createOrderedAggregatorFactory(TestingAggregationFunction arrayAgg, SortOrder ordering)
     {
-        AccumulatorFactory distinctOrderedFactory = new OrderedAccumulatorFactory(
+        OrderedAccumulatorFactory distinctOrderedFactory = new OrderedAccumulatorFactory(
                 arrayAgg.getDistinctFactory(),
                 ImmutableList.of(BIGINT),
                 ImmutableList.of(0),
@@ -333,11 +332,10 @@ public class TestStreamingAggregationOperator
         return new AggregatorFactory(
                 distinctOrderedFactory,
                 SINGLE,
-                arrayAgg.getIntermediateType(),
+                distinctOrderedFactory.spillType(),
                 arrayAgg.getFinalType(),
                 ImmutableList.of(1),
                 OptionalInt.empty(),
-                false, // spillable
                 ImmutableList.of());
     }
 

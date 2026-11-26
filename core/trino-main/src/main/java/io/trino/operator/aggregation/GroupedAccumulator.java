@@ -28,10 +28,14 @@ public interface GroupedAccumulator
 
     void addIntermediate(int[] groupIds, Block block);
 
+    /**
+     * Groups may be evaluated in any order, for example in hash order when spilling. No input is added afterwards.
+     */
     void evaluateIntermediate(int groupId, BlockBuilder output);
 
     /**
-     * Ordered aggregations require ascending group id order, which holds since they are not spillable.
+     * Ordered aggregations require ascending group id order. This holds because final results are always
+     * produced in group id order, while spilling only uses {@link #evaluateIntermediate}.
      */
     void evaluateFinal(int groupId, BlockBuilder output);
 

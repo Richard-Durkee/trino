@@ -19,19 +19,28 @@ import io.trino.operator.FlatHashStrategyCompiler;
 import io.trino.operator.MarkDistinctHash;
 import io.trino.operator.UpdateMemory;
 import io.trino.operator.Work;
+import io.trino.operator.aggregation.SpilledRows.Rows;
 import io.trino.spi.Page;
+import io.trino.spi.PageBuilder;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.block.IntArrayBlock;
 import io.trino.spi.type.Type;
 import jakarta.annotation.Nullable;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
+import static io.airlift.slice.SizeOf.sizeOf;
+import static io.trino.operator.aggregation.SpilledRows.readRows;
+import static io.trino.operator.aggregation.SpilledRows.writeRows;
 import static io.trino.spi.type.IntegerType.INTEGER;
+import static java.lang.Math.max;
+import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
 public class DistinctAccumulatorFactory
@@ -73,7 +82,7 @@ public class DistinctAccumulatorFactory
     @Override
     public Accumulator createIntermediateAccumulator(List<Supplier<Object>> lambdaProviders)
     {
-        return delegate.createIntermediateAccumulator(lambdaProviders);
+        throw new UnsupportedOperationException("Distinct aggregation is not decomposable");
     }
 
     @Override
@@ -86,10 +95,16 @@ public class DistinctAccumulatorFactory
                 hashStrategyCompiler);
     }
 
+    // Spilled state is the group's distinct rows, which a new instance deduplicates again in addIntermediate()
     @Override
     public GroupedAccumulator createGroupedIntermediateAccumulator(List<Supplier<Object>> lambdaProviders)
     {
-        return delegate.createGroupedIntermediateAccumulator(lambdaProviders);
+        return createGroupedAccumulator(lambdaProviders);
+    }
+
+    public Type spillType()
+    {
+        return SpilledRows.spillType(argumentTypes);
     }
 
     @Override
@@ -189,8 +204,16 @@ public class DistinctAccumulatorFactory
             implements GroupedAccumulator
     {
         private final GroupedAccumulator accumulator;
+        private final List<Type> hashTypes;
         @Nullable
         private MarkDistinctHash hash; // null after prepareFinal() is called
+        @Nullable
+        private int[] groupDistinctRowStarts; // set by the first evaluateIntermediate()
+        @Nullable
+        private int[] groupDistinctRowIds; // distinct ids ordered by group, set by the first evaluateIntermediate()
+        @Nullable
+        private PageBuilder spillPageBuilder; // reused across groups by evaluateIntermediate()
+        private int groupCount;
 
         private DistinctGroupedAccumulator(
                 GroupedAccumulator accumulator,
@@ -199,12 +222,13 @@ public class DistinctAccumulatorFactory
                 FlatHashStrategyCompiler hashStrategyCompiler)
         {
             this.accumulator = requireNonNull(accumulator, "accumulator is null");
+            this.hashTypes = ImmutableList.<Type>builder()
+                    .add(INTEGER) // group id column
+                    .addAll(inputTypes)
+                    .build();
             this.hash = new MarkDistinctHash(
                     session,
-                    ImmutableList.<Type>builder()
-                            .add(INTEGER) // group id column
-                            .addAll(inputTypes)
-                            .build(),
+                    hashTypes,
                     hashStrategyCompiler,
                     UpdateMemory.NOOP);
         }
@@ -216,12 +240,16 @@ public class DistinctAccumulatorFactory
             if (hash != null) {
                 estimatedSize += hash.getEstimatedSize();
             }
+            if (groupDistinctRowStarts != null) {
+                estimatedSize += sizeOf(groupDistinctRowStarts) + sizeOf(groupDistinctRowIds);
+            }
             return estimatedSize;
         }
 
         @Override
         public void setGroupCount(int groupCount)
         {
+            this.groupCount = max(this.groupCount, groupCount);
             accumulator.setGroupCount(groupCount);
         }
 
@@ -229,6 +257,7 @@ public class DistinctAccumulatorFactory
         public void addInput(int[] groupIds, Page page, AggregationMask mask)
         {
             checkState(hash != null, "prepareFinal() has already been called");
+            checkState(groupDistinctRowStarts == null, "evaluateIntermediate() has already been called");
             // 1. filter out positions based on mask
             groupIds = maskGroupIds(groupIds, mask);
             page = mask.filterPage(page);
@@ -266,13 +295,77 @@ public class DistinctAccumulatorFactory
         @Override
         public void addIntermediate(int[] groupIds, Block block)
         {
-            throw new UnsupportedOperationException();
+            Rows rows = readRows(groupIds, block);
+            addInput(rows.groupIds(), rows.page(), AggregationMask.createSelectAll(rows.page().getPositionCount()));
         }
 
+        // Called for spilling, in any group order
         @Override
         public void evaluateIntermediate(int groupId, BlockBuilder output)
         {
-            throw new UnsupportedOperationException();
+            checkState(hash != null, "prepareFinal() has already been called");
+            checkArgument(groupId < groupCount, "groupId %s is not below group count %s", groupId, groupCount);
+            groupDistinctRows();
+            int start = groupDistinctRowStarts[groupId];
+            int end = groupDistinctRowStarts[groupId + 1];
+            PageBuilder pageBuilder = spillPageBuilder();
+            for (int index = start; index < end; index++) {
+                hash.appendValuesTo(groupDistinctRowIds[index], pageBuilder);
+                pageBuilder.declarePosition();
+            }
+            Page values = pageBuilder.build();
+            writeRows(output, values.getPositionCount(), (row, fieldBuilders) -> {
+                for (int field = 0; field < fieldBuilders.size(); field++) {
+                    // channel 0 of the hash is the group id
+                    Block block = values.getBlock(field + 1);
+                    fieldBuilders.get(field).append(block.getUnderlyingValueBlock(), block.getUnderlyingValuePosition(row));
+                }
+            });
+        }
+
+        private PageBuilder spillPageBuilder()
+        {
+            if (spillPageBuilder == null) {
+                spillPageBuilder = new PageBuilder(hashTypes);
+            }
+            spillPageBuilder.reset();
+            return spillPageBuilder;
+        }
+
+        // Orders the distinct ids by group, reading the group id of each distinct row from channel 0 of the hash
+        private void groupDistinctRows()
+        {
+            if (groupDistinctRowStarts != null) {
+                return;
+            }
+            int distinctRowCount = toIntExact(hash.getGroupCount());
+            int[] groupIds = new int[distinctRowCount];
+            int distinctId = 0;
+            while (distinctId < distinctRowCount) {
+                PageBuilder pageBuilder = spillPageBuilder();
+                int firstDistinctId = distinctId;
+                while (distinctId < distinctRowCount && !pageBuilder.isFull()) {
+                    hash.appendValuesTo(distinctId, pageBuilder);
+                    pageBuilder.declarePosition();
+                    distinctId++;
+                }
+                Block groupIdBlock = pageBuilder.build().getBlock(0);
+                for (int position = 0; position < groupIdBlock.getPositionCount(); position++) {
+                    groupIds[firstDistinctId + position] = INTEGER.getInt(groupIdBlock, position);
+                }
+            }
+            groupDistinctRowStarts = new int[groupCount + 1];
+            for (distinctId = 0; distinctId < distinctRowCount; distinctId++) {
+                groupDistinctRowStarts[groupIds[distinctId] + 1]++;
+            }
+            for (int groupId = 0; groupId < groupCount; groupId++) {
+                groupDistinctRowStarts[groupId + 1] += groupDistinctRowStarts[groupId];
+            }
+            int[] nextPositions = Arrays.copyOf(groupDistinctRowStarts, groupCount);
+            groupDistinctRowIds = new int[distinctRowCount];
+            for (distinctId = 0; distinctId < distinctRowCount; distinctId++) {
+                groupDistinctRowIds[nextPositions[groupIds[distinctId]]++] = distinctId;
+            }
         }
 
         @Override

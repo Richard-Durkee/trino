@@ -33,7 +33,6 @@ public class AggregatorFactory
     private final Type finalType;
     private final List<Integer> inputChannels;
     private final OptionalInt maskChannel;
-    private final boolean spillable;
     private final List<Supplier<Object>> lambdaProviders;
 
     public AggregatorFactory(
@@ -43,7 +42,6 @@ public class AggregatorFactory
             Type finalType,
             List<Integer> inputChannels,
             OptionalInt maskChannel,
-            boolean spillable,
             List<Supplier<Object>> lambdaProviders)
     {
         this.accumulatorFactory = requireNonNull(accumulatorFactory, "accumulatorFactory is null");
@@ -52,7 +50,6 @@ public class AggregatorFactory
         this.finalType = requireNonNull(finalType, "finalType is null");
         this.inputChannels = ImmutableList.copyOf(requireNonNull(inputChannels, "inputChannels is null"));
         this.maskChannel = requireNonNull(maskChannel, "maskChannel is null");
-        this.spillable = spillable;
         this.lambdaProviders = ImmutableList.copyOf(requireNonNull(lambdaProviders, "lambdaProviders is null"));
 
         checkArgument(step.isInputRaw() || inputChannels.size() == 1, "expected 1 input channel for intermediate aggregation");
@@ -98,10 +95,5 @@ public class AggregatorFactory
             accumulator = accumulatorFactory.createGroupedIntermediateAccumulator(lambdaProviders);
         }
         return new GroupedAggregator(accumulator, step, intermediateType, finalType, ImmutableList.of(inputChannel), maskChannel, accumulatorFactory.createAggregationMaskBuilder(), metrics);
-    }
-
-    public boolean isSpillable()
-    {
-        return spillable;
     }
 }

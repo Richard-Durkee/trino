@@ -22,7 +22,6 @@ import io.trino.memory.MemoryPool;
 import io.trino.memory.QueryContext;
 import io.trino.metadata.TestingFunctionResolution;
 import io.trino.operator.AggregationOperator.AggregationOperatorFactory;
-import io.trino.operator.aggregation.AccumulatorFactory;
 import io.trino.operator.aggregation.AggregatorFactory;
 import io.trino.operator.aggregation.OrderedAccumulatorFactory;
 import io.trino.operator.aggregation.TestingAggregationFunction;
@@ -227,7 +226,7 @@ public class TestAggregationOperator
             throws Exception
     {
         TestingAggregationFunction arrayAgg = FUNCTION_RESOLUTION.getAggregateFunction("array_agg", fromTypes(BIGINT));
-        AccumulatorFactory distinctOrderedFactory = new OrderedAccumulatorFactory(
+        OrderedAccumulatorFactory distinctOrderedFactory = new OrderedAccumulatorFactory(
                 arrayAgg.getDistinctFactory(),
                 ImmutableList.of(BIGINT),
                 ImmutableList.of(0),
@@ -237,11 +236,10 @@ public class TestAggregationOperator
         AggregatorFactory aggregatorFactory = new AggregatorFactory(
                 distinctOrderedFactory,
                 SINGLE,
-                arrayAgg.getIntermediateType(),
+                distinctOrderedFactory.spillType(),
                 arrayAgg.getFinalType(),
                 ImmutableList.of(0),
                 OptionalInt.empty(),
-                false, // spillable
                 ImmutableList.of());
 
         // all values distinct and in descending order

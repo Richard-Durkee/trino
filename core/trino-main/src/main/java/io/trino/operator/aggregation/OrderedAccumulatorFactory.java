@@ -21,6 +21,7 @@ import io.trino.operator.PagesIndex;
 import io.trino.operator.PagesIndex.Factory;
 import io.trino.operator.PagesIndexOrdering;
 import io.trino.operator.UpdateMemory;
+import io.trino.operator.aggregation.SpilledRows.Rows;
 import io.trino.spi.Page;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
@@ -38,6 +39,8 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static io.airlift.slice.SizeOf.sizeOf;
 import static io.airlift.units.DataSize.Unit.MEGABYTE;
+import static io.trino.operator.aggregation.SpilledRows.readRows;
+import static io.trino.operator.aggregation.SpilledRows.writeRows;
 import static java.lang.Math.max;
 import static java.util.Objects.requireNonNull;
 
@@ -102,7 +105,7 @@ public class OrderedAccumulatorFactory
     @Override
     public Accumulator createIntermediateAccumulator(List<Supplier<Object>> lambdaProviders)
     {
-        return delegate.createIntermediateAccumulator(lambdaProviders);
+        throw new UnsupportedOperationException("Ordered aggregation is not decomposable");
     }
 
     @Override
@@ -118,10 +121,16 @@ public class OrderedAccumulatorFactory
                 maxBatchSizeInBytes);
     }
 
+    // Spilled state is the group's buffered rows, which a new instance buffers again in addIntermediate()
     @Override
     public GroupedAccumulator createGroupedIntermediateAccumulator(List<Supplier<Object>> lambdaProviders)
     {
-        return delegate.createGroupedIntermediateAccumulator(lambdaProviders);
+        return createGroupedAccumulator(lambdaProviders);
+    }
+
+    public Type spillType()
+    {
+        return SpilledRows.spillType(sourceTypes);
     }
 
     @Override
@@ -298,6 +307,7 @@ public class OrderedAccumulatorFactory
         public void addInput(int[] groupIds, Page page, AggregationMask mask)
         {
             checkState(updateMemory == null, "prepareFinal() already called");
+            checkState(groupStarts == null, "Rows already grouped by evaluateIntermediate()");
             if (mask.isSelectNone()) {
                 return;
             }
@@ -316,13 +326,23 @@ public class OrderedAccumulatorFactory
         @Override
         public void addIntermediate(int[] groupIds, Block block)
         {
-            throw new UnsupportedOperationException();
+            Rows rows = readRows(groupIds, block);
+            addInput(rows.groupIds(), rows.page(), AggregationMask.createSelectAll(rows.page().getPositionCount()));
         }
 
+        // Called for spilling, in any group order, before the rows are sorted
         @Override
         public void evaluateIntermediate(int groupId, BlockBuilder output)
         {
-            throw new UnsupportedOperationException();
+            checkState(updateMemory == null, "prepareFinal() already called");
+            checkArgument(groupId < groupCount, "groupId %s is not below group count %s", groupId, groupCount);
+            groupRows();
+            int groupStart = groupStarts[groupId];
+            writeRows(output, groupStarts[groupId + 1] - groupStart, (row, fieldBuilders) -> {
+                for (int channel = 0; channel < fieldBuilders.size(); channel++) {
+                    pagesIndex.appendTo(channel, groupStart + row, fieldBuilders.get(channel));
+                }
+            });
         }
 
         @Override
@@ -342,6 +362,20 @@ public class OrderedAccumulatorFactory
         {
             checkState(this.updateMemory == null, "prepareFinal() already called");
             this.updateMemory = requireNonNull(updateMemory, "updateMemory is null");
+            groupRows();
+            for (int groupId = 0; groupId < groupCount; groupId++) {
+                if (groupStarts[groupId + 1] - groupStarts[groupId] > 1) {
+                    pagesIndex.sort(pagesIndexOrdering, groupStarts[groupId], groupStarts[groupId + 1]);
+                }
+            }
+        }
+
+        // Moves the rows of each group into a contiguous position range starting at groupStarts[groupId]
+        private void groupRows()
+        {
+            if (groupStarts != null) {
+                return;
+            }
             int positionCount = pagesIndex.getPositionCount();
             int[] groupIds = rowGroupIds.elements();
             groupStarts = new int[groupCount + 1];
@@ -370,11 +404,6 @@ public class OrderedAccumulatorFactory
                 }
             }
             rowGroupIds = null;
-            for (int groupId = 0; groupId < groupCount; groupId++) {
-                if (groupStarts[groupId + 1] - groupStarts[groupId] > 1) {
-                    pagesIndex.sort(pagesIndexOrdering, groupStarts[groupId], groupStarts[groupId + 1]);
-                }
-            }
         }
 
         private void buildNextBatch()

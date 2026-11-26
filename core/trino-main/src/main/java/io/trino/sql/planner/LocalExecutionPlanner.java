@@ -3861,14 +3861,18 @@ public class LocalExecutionPlanner
                             resolvedFunction.functionNullability(),
                             specializeAggregationLoops));
 
+            // DISTINCT and ORDER BY aggregations are never decomposed, so their intermediate state is only used for spilling
+            Optional<Type> spillType = Optional.empty();
             if (aggregation.isDistinct()) {
-                accumulatorFactory = new DistinctAccumulatorFactory(
+                DistinctAccumulatorFactory distinctAccumulatorFactory = new DistinctAccumulatorFactory(
                         accumulatorFactory,
                         argumentChannels.stream()
                                 .map(channel -> source.getTypes().get(channel))
                                 .collect(toImmutableList()),
                         hashStrategyCompiler,
                         session);
+                spillType = Optional.of(distinctAccumulatorFactory.spillType());
+                accumulatorFactory = distinctAccumulatorFactory;
             }
 
             if (aggregation.getOrderingScheme().isPresent()) {
@@ -3893,7 +3897,7 @@ public class LocalExecutionPlanner
                     inputOrderByChannels.add(inputChannel);
                 }
 
-                accumulatorFactory = new OrderedAccumulatorFactory(
+                OrderedAccumulatorFactory orderedAccumulatorFactory = new OrderedAccumulatorFactory(
                         accumulatorFactory,
                         argumentChannels.stream()
                                 .map(channel -> source.getTypes().get(channel))
@@ -3902,12 +3906,24 @@ public class LocalExecutionPlanner
                         inputOrderByChannels,
                         sortOrders,
                         pagesIndexFactory);
+                spillType = Optional.of(orderedAccumulatorFactory.spillType());
+                accumulatorFactory = orderedAccumulatorFactory;
             }
 
             List<Type> intermediateTypes = aggregationImplementation.getAccumulatorStateDescriptors().stream()
                     .map(stateDescriptor -> stateDescriptor.getSerializer().getSerializedType())
                     .collect(toImmutableList());
-            Type intermediateType = (intermediateTypes.size() == 1) ? getOnlyElement(intermediateTypes) : RowType.anonymous(intermediateTypes);
+            checkState(spillType.isEmpty() || step == Step.SINGLE, "DISTINCT and ORDER BY aggregations must be single step: %s", step);
+            Type intermediateType;
+            if (spillType.isPresent()) {
+                intermediateType = spillType.get();
+            }
+            else if (intermediateTypes.size() == 1) {
+                intermediateType = getOnlyElement(intermediateTypes);
+            }
+            else {
+                intermediateType = RowType.anonymous(intermediateTypes);
+            }
             Type finalType = resolvedFunction.signature().getReturnType();
 
             OptionalInt maskChannel = aggregation.getMask().stream()
@@ -3931,7 +3947,6 @@ public class LocalExecutionPlanner
                     finalType,
                     argumentChannels,
                     maskChannel,
-                    !aggregation.isDistinct() && aggregation.getOrderingScheme().isEmpty(),
                     lambdaProviders);
         }
 

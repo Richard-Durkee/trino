@@ -400,8 +400,7 @@ public class HashAggregationOperator
             if (step.isOutputPartial() && partialAggregationDisabled) {
                 aggregationBuilder = new SkipAggregationBuilder(groupByChannels, aggregatorFactories, memoryContext, aggregationMetrics);
             }
-            else if (step.isOutputPartial() || !spillEnabled || !isSpillable()) {
-                // TODO: We ignore spillEnabled here if any aggregate has ORDER BY clause or DISTINCT because they are not yet implemented for spilling.
+            else if (step.isOutputPartial() || !spillEnabled) {
                 aggregationBuilder = new InMemoryHashAggregationBuilder(
                         aggregatorFactories,
                         step,
@@ -452,11 +451,6 @@ public class HashAggregationOperator
         aggregationBuilder.updateMemory();
         aggregationInputBytesProcessed += page.getSizeInBytes();
         aggregationInputRowsProcessed += page.getPositionCount();
-    }
-
-    private boolean isSpillable()
-    {
-        return aggregatorFactories.stream().allMatch(AggregatorFactory::isSpillable);
     }
 
     @Override
