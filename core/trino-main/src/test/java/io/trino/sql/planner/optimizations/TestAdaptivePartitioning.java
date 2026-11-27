@@ -140,6 +140,32 @@ public class TestAdaptivePartitioning
     }
 
     @Test
+    public void testSmallBuildSideKeepsPartitionCount()
+    {
+        // the join holds only the 0.5MB build side, which is below the 2MB limit
+        // for 2 partitions, so the large probe side does not cause re-partitioning
+        SubPlanMatcher matcher = SubPlanMatcher.builder()
+                .fragmentMatcher(fm -> fm.fragmentId(0))
+                .children(
+                        sb -> sb.fragmentMatcher(fm -> fm.fragmentId(1)),
+                        sb -> sb.fragmentMatcher(fm -> fm.fragmentId(2)))
+                .build();
+
+        assertAdaptivePlan(
+                """
+                SELECT l.* FROM lineitem l
+                LEFT JOIN nation n
+                ON l.suppkey = n.nationkey
+                """,
+                getSession(),
+                ImmutableMap.of(
+                        new PlanFragmentId("1"), createRuntimeStats(ImmutableLongArray.of(ONE_MB * 4, ONE_MB * 4, ONE_MB * 2), 10000),
+                        new PlanFragmentId("2"), createRuntimeStats(ImmutableLongArray.of(ONE_MB / 4, ONE_MB / 4), 500)),
+                matcher,
+                true);
+    }
+
+    @Test
     public void testSkipBroadcastSubtree()
     {
         // result of fragment 7 will be broadcast,

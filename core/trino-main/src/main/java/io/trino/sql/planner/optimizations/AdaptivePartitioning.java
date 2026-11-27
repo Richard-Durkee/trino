@@ -13,23 +13,42 @@
  */
 package io.trino.sql.planner.optimizations;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import io.airlift.log.Logger;
 import io.trino.cost.RuntimeInfoProvider;
-import io.trino.execution.scheduler.faulttolerant.OutputStatsEstimator.OutputStatsEstimateResult;
 import io.trino.sql.planner.PartitioningHandle;
 import io.trino.sql.planner.PartitioningScheme;
 import io.trino.sql.planner.PlanFragment;
 import io.trino.sql.planner.PlanNodeIdAllocator;
+import io.trino.sql.planner.plan.AdaptivePlanNode;
+import io.trino.sql.planner.plan.AggregationNode;
+import io.trino.sql.planner.plan.AssignUniqueId;
+import io.trino.sql.planner.plan.DynamicFilterSourceNode;
+import io.trino.sql.planner.plan.EnforceSingleRowNode;
 import io.trino.sql.planner.plan.ExchangeNode;
+import io.trino.sql.planner.plan.FilterNode;
+import io.trino.sql.planner.plan.GroupIdNode;
+import io.trino.sql.planner.plan.IndexJoinNode;
+import io.trino.sql.planner.plan.JoinNode;
+import io.trino.sql.planner.plan.LimitNode;
+import io.trino.sql.planner.plan.OffsetNode;
+import io.trino.sql.planner.plan.OutputNode;
+import io.trino.sql.planner.plan.PlanFragmentId;
 import io.trino.sql.planner.plan.PlanNode;
 import io.trino.sql.planner.plan.PlanNodeId;
+import io.trino.sql.planner.plan.PlanVisitor;
+import io.trino.sql.planner.plan.ProjectNode;
 import io.trino.sql.planner.plan.RemoteSourceNode;
+import io.trino.sql.planner.plan.SampleNode;
+import io.trino.sql.planner.plan.SemiJoinNode;
 import io.trino.sql.planner.plan.SimplePlanRewriter;
+import io.trino.sql.planner.plan.SpatialJoinNode;
 import io.trino.sql.planner.plan.TableExecuteNode;
+import io.trino.sql.planner.plan.TopNNode;
+import io.trino.sql.planner.plan.UnnestNode;
 
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -46,6 +65,7 @@ import static io.trino.sql.planner.SystemPartitioningHandle.FIXED_BROADCAST_DIST
 import static io.trino.sql.planner.SystemPartitioningHandle.FIXED_HASH_DISTRIBUTION;
 import static io.trino.sql.planner.SystemPartitioningHandle.SCALED_WRITER_HASH_DISTRIBUTION;
 import static io.trino.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
+import static io.trino.sql.planner.plan.AggregationNode.Step.PARTIAL;
 import static io.trino.sql.planner.plan.ExchangeNode.Scope.REMOTE;
 import static io.trino.sql.planner.plan.ExchangeNode.Type.REPARTITION;
 import static io.trino.sql.planner.plan.ExchangeNode.Type.REPLICATE;
@@ -103,27 +123,7 @@ public class AdaptivePartitioning
             }
 
             int partitionCount = fragment.getPartitionCount().orElse(maxPartitionCount);
-            // calculate (estimated) input data size to determine if we want to change number of partitions at runtime
-            List<Long> partitionedInputBytes = fragment.getRemoteSourceNodes().stream()
-                    // skip for replicate exchange since it's assumed that broadcast join will be chosen by
-                    // static optimizer only if build size is small.
-                    // TODO: Fix this assumption by using runtime stats
-                    .filter(remoteSourceNode -> remoteSourceNode.getExchangeType() != REPLICATE)
-                    .map(remoteSourceNode -> remoteSourceNode.getSourceFragmentIds().stream()
-                            .mapToLong(sourceFragmentId -> {
-                                OutputStatsEstimateResult runtimeStats = runtimeInfoProvider.getRuntimeOutputStats(sourceFragmentId);
-                                return runtimeStats.outputDataSizeEstimate().getTotalSizeInBytes();
-                            })
-                            .sum())
-                    .collect(toImmutableList());
-
-            // Currently the memory estimation is simplified:
-            // if it's an aggregation, then we use the total input bytes as the memory consumption
-            // if it involves multiple joins, conservatively we assume the smallest remote source will be streamed through
-            // and use the sum of input bytes of other remote sources as the memory consumption
-            // TODO: more accurate memory estimation based on context (https://github.com/trinodb/trino/issues/18698)
-            long estimatedMemoryConsumptionInBytes = (partitionedInputBytes.size() == 1) ? partitionedInputBytes.get(0) :
-                    partitionedInputBytes.stream().mapToLong(Long::longValue).sum() - Collections.min(partitionedInputBytes);
+            long estimatedMemoryConsumptionInBytes = estimateMemoryConsumption(fragment.getRoot(), runtimeInfoProvider);
 
             if (estimatedMemoryConsumptionInBytes > runtimeAdaptivePartitioningMaxTaskSizeInBytes * partitionCount) {
                 log.info("Stage %s.%s has an estimated memory consumption of %s, changing partition count from %s to %s",
@@ -141,6 +141,18 @@ public class AdaptivePartitioning
         return new Result(plan, ImmutableSet.of());
     }
 
+    /**
+     * Estimates the memory a fragment needs from the runtime size of its remote inputs (https://github.com/trinodb/trino/issues/18698).
+     * Input bytes count once they reach an operator that holds its input, such as the build side of a join or an aggregation.
+     * Operators not known to stream, such as a window or a sort, are assumed to hold their input. Bytes that only stream
+     * through, such as the probe side of a join, do not count.
+     */
+    @VisibleForTesting
+    static long estimateMemoryConsumption(PlanNode root, RuntimeInfoProvider runtimeInfoProvider)
+    {
+        return root.accept(new MemoryEstimator(runtimeInfoProvider), null).retainedBytes();
+    }
+
     public static boolean consumesHashPartitionedInput(PlanFragment fragment)
     {
         return isPartitioned(fragment.getPartitioning());
@@ -149,6 +161,203 @@ public class AdaptivePartitioning
     private static boolean isPartitioned(PartitioningHandle partitioningHandle)
     {
         return partitioningHandle.equals(FIXED_HASH_DISTRIBUTION) || partitioningHandle.equals(SCALED_WRITER_HASH_DISTRIBUTION);
+    }
+
+    /**
+     * @param streamedBytes estimated bytes a subtree outputs
+     * @param retainedBytes estimated bytes held in memory by operators in the subtree
+     */
+    private record MemoryEstimate(long streamedBytes, long retainedBytes)
+    {
+        private static final MemoryEstimate NONE = new MemoryEstimate(0, 0);
+
+        public MemoryEstimate plus(MemoryEstimate other)
+        {
+            return new MemoryEstimate(streamedBytes + other.streamedBytes, retainedBytes + other.retainedBytes);
+        }
+
+        // The operator holds all of its input, and its output is taken to be as large as its input
+        public MemoryEstimate retainInput()
+        {
+            return new MemoryEstimate(streamedBytes, retainedBytes + streamedBytes);
+        }
+
+        public MemoryEstimate withoutOutput()
+        {
+            return new MemoryEstimate(0, retainedBytes);
+        }
+    }
+
+    private static class MemoryEstimator
+            extends PlanVisitor<MemoryEstimate, Void>
+    {
+        private final RuntimeInfoProvider runtimeInfoProvider;
+
+        private MemoryEstimator(RuntimeInfoProvider runtimeInfoProvider)
+        {
+            this.runtimeInfoProvider = requireNonNull(runtimeInfoProvider, "runtimeInfoProvider is null");
+        }
+
+        // Operators not handled below are assumed to hold all of their input
+        @Override
+        protected MemoryEstimate visitPlan(PlanNode node, Void context)
+        {
+            return visitSources(node).retainInput();
+        }
+
+        @Override
+        public MemoryEstimate visitRemoteSource(RemoteSourceNode node, Void context)
+        {
+            // skip for replicate exchange since it's assumed that broadcast join will be chosen by
+            // static optimizer only if build size is small.
+            // TODO: Fix this assumption by using runtime stats
+            if (node.getExchangeType() == REPLICATE) {
+                return MemoryEstimate.NONE;
+            }
+            long bytes = 0;
+            for (PlanFragmentId sourceFragmentId : node.getSourceFragmentIds()) {
+                bytes += runtimeInfoProvider.getRuntimeOutputStats(sourceFragmentId).outputDataSizeEstimate().getTotalSizeInBytes();
+            }
+            return new MemoryEstimate(bytes, 0);
+        }
+
+        @Override
+        public MemoryEstimate visitJoin(JoinNode node, Void context)
+        {
+            return join(node.getLeft(), node.getRight());
+        }
+
+        @Override
+        public MemoryEstimate visitSemiJoin(SemiJoinNode node, Void context)
+        {
+            return node.getSource().accept(this, context).plus(node.getFilteringSource().accept(this, context).retainInput().withoutOutput());
+        }
+
+        @Override
+        public MemoryEstimate visitSpatialJoin(SpatialJoinNode node, Void context)
+        {
+            return join(node.getLeft(), node.getRight());
+        }
+
+        @Override
+        public MemoryEstimate visitIndexJoin(IndexJoinNode node, Void context)
+        {
+            return join(node.getProbeSource(), node.getIndexSource());
+        }
+
+        @Override
+        public MemoryEstimate visitGroupId(GroupIdNode node, Void context)
+        {
+            // each input row is output once for every grouping set
+            MemoryEstimate source = visitSources(node);
+            return new MemoryEstimate(source.streamedBytes() * node.getGroupingSets().size(), source.retainedBytes());
+        }
+
+        @Override
+        public MemoryEstimate visitAggregation(AggregationNode node, Void context)
+        {
+            MemoryEstimate source = node.getSource().accept(this, context);
+            // partial aggregation memory is bounded by max_partial_aggregation_memory
+            if (node.getStep() == PARTIAL) {
+                return source;
+            }
+            return source.retainInput();
+        }
+
+        @Override
+        public MemoryEstimate visitTopN(TopNNode node, Void context)
+        {
+            // holds at most count rows
+            return new MemoryEstimate(0, node.getSource().accept(this, context).retainedBytes());
+        }
+
+        @Override
+        public MemoryEstimate visitAdaptivePlanNode(AdaptivePlanNode node, Void context)
+        {
+            return node.getCurrentPlan().accept(this, context);
+        }
+
+        @Override
+        public MemoryEstimate visitExchange(ExchangeNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitProject(ProjectNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitFilter(FilterNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitLimit(LimitNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitOutput(OutputNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitOffset(OffsetNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitSample(SampleNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitEnforceSingleRow(EnforceSingleRowNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        // UNNEST usually runs below the exchange, so the remote input size already includes its output
+        @Override
+        public MemoryEstimate visitUnnest(UnnestNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitAssignUniqueId(AssignUniqueId node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        @Override
+        public MemoryEstimate visitDynamicFilterSource(DynamicFilterSourceNode node, Void context)
+        {
+            return visitSources(node);
+        }
+
+        // The build side is held, and the output is taken to be as large as both inputs, ignoring rows the join may add
+        private MemoryEstimate join(PlanNode probe, PlanNode build)
+        {
+            return probe.accept(this, null).plus(build.accept(this, null).retainInput());
+        }
+
+        private MemoryEstimate visitSources(PlanNode node)
+        {
+            MemoryEstimate estimate = MemoryEstimate.NONE;
+            for (PlanNode source : node.getSources()) {
+                estimate = estimate.plus(source.accept(this, null));
+            }
+            return estimate;
+        }
     }
 
     private static class Rewriter
